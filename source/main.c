@@ -3,11 +3,14 @@
  *
  * Milestone 1: boot, poll pm for application launches, log each launch/exit with its
  * program ID to sdmc:/config/bootsplash/bootsplash.log.
+ * Milestone 2: on launch, show a solid-color full-screen layer for N ms.
  */
 #include <switch.h>
 
 #include "app_monitor.h"
+#include "config.h"
 #include "log.h"
+#include "splash.h"
 
 #define POLL_INTERVAL_NS 10000000ULL /* 10 ms, same as sys-tune */
 
@@ -20,6 +23,10 @@ u32 __nx_applet_type = AppletType_None;
 
 /* We only need one fs session (for sdmc). */
 u32 __nx_fs_num_sessions = 1;
+
+/* nvdrv transfer memory. libnx's default is 8 MiB, which we can't afford. Ultrahand's
+ * libtesla runs a 2-buffer layer with 0x15000. Allocated from the inner heap. */
+u32 __nx_nv_transfermem_size = 0x15000;
 
 /* Static inner heap. This keeps the kernel heap region untouched, so later milestones
  * can grow it with svcSetHeapSize only while a splash is showing (DESIGN.md §3). */
@@ -106,8 +113,8 @@ int main(int argc, char **argv) {
     logInit();
 
     const u32 hos = hosversionGet();
-    logWrite("----- bootsplash started (milestone 1), HOS %u.%u.%u -----",
-             HOSVER_MAJOR(hos), HOSVER_MINOR(hos), HOSVER_MICRO(hos));
+    logWrite("----- bootsplash started (milestone 2, build %s %s), HOS %u.%u.%u -----",
+             __DATE__, __TIME__, HOSVER_MAJOR(hos), HOSVER_MINOR(hos), HOSVER_MICRO(hos));
 
     Result rc = appMonitorInitialize();
     if (R_FAILED(rc)) {
@@ -117,9 +124,26 @@ int main(int argc, char **argv) {
 
     while (true) {
         AppEvent ev;
-        if (appMonitorPoll(&ev))
+        if (appMonitorPoll(&ev)) {
             logEvent(&ev);
 
+            if (ev.type == AppEvent_Launched) {
+                Config cfg;
+                configLoad(&cfg);
+                const bool hbl = ev.has_ams_info && (ev.status.flags & AMS_OVERRIDE_FLAG_HBL);
+
+                if (!cfg.enabled)
+                    logWrite("SPLASH  disabled in config");
+                else if (hbl && cfg.skip_hbl)
+                    logWrite("SPLASH  skipped (hbmenu title takeover)");
+                else
+                    splashStart(ev.pid, ev.program_id, ev.tick, &cfg);
+            } else if (ev.type == AppEvent_Exited) {
+                splashCancel(ev.pid);
+            }
+        }
+
+        splashReap();
         svcSleepThread(POLL_INTERVAL_NS);
     }
 

@@ -170,7 +170,7 @@ blank logos would also work, but it changes game files, which is what we set out
 | R1 | `viCreateManagedLayer` from a non-applet sysmodule on 21.2.0. nx-ovlloader does the same thing, so it's likely fine. | M2 | none needed if it works; otherwise investigate before going further |
 | R2 | **Single buffering**: with one buffer, `framebufferBegin` may block until the compositor releases it, or show nothing. | M2 (log `framebufferBegin` timing) | 2 buffers, 4 MiB transient heap |
 | R3 | `svcSetHeapSize(2 MiB)` fails when ovlloader and other sysmodules are loaded | M2 (logged result) | Skip the splash and log, or reduce other sysmodules |
-| R4 | Compositor blending is **straight vs premultiplied** alpha, which affects the alpha-only fade | M2 test pattern: 50% alpha red over the game | If premultiplied, also scale RGB in place each step |
+| R4 | Compositor blending is **straight vs premultiplied** alpha, which affects the alpha-only fade | **Resolved 2026-11-13: premultiplied.** White at α=0 showed as solid white, and red at α=8 was see-through over the HOME menu. | The fade scales RGB **and** A each step. Fully transparent pixels must be 0x0000. |
 | R5 | Layer stacks: does `Default`+`Lcd` cover both TV and handheld? | M2 docked and handheld | Copy libtesla's list exactly |
 | R6 | Overlay vs the stock logo timing | M1 log timestamps against a slow-mo phone video; M2 | M6 |
 | R7 | Homebrew title takeover would get a splash | M1 logs the `hbl` flag | Skip when `hbl=1` (M5) |

@@ -94,6 +94,7 @@ dist: all
 	@touch $(DISTDIR)/atmosphere/contents/$(PROGRAM_ID)/flags/boot2.flag
 	@cp toolbox.json $(DISTDIR)/atmosphere/contents/$(PROGRAM_ID)/toolbox.json
 	@mkdir -p $(DISTDIR)/config/bootsplash
+	@cp res/config.ini $(DISTDIR)/config/bootsplash/config.ini
 	@echo built ... $(DISTDIR)/
 
 clean:
