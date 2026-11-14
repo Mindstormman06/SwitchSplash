@@ -115,14 +115,16 @@ static void logEvent(const AppEvent *ev) {
 
 int main(int argc, char **argv) {
     logInit();
+    logStart();
 
     const u32 hos = hosversionGet();
-    logWrite("----- bootsplash started (milestone 5, build %s %s), HOS %u.%u.%u -----",
+    logWrite("----- bootsplash started (milestone 5 + fast start, build %s %s), HOS %u.%u.%u -----",
              __DATE__, __TIME__, HOSVER_MAJOR(hos), HOSVER_MINOR(hos), HOSVER_MICRO(hos));
 
     Result rc = appMonitorInitialize();
     if (R_FAILED(rc)) {
         logWrite("FATAL appMonitorInitialize failed: 0x%x", rc);
+        svcSleepThread(600000000ULL); /* let the log writer flush (it runs every 250 ms) */
         return 0; /* Exit quietly rather than crash the console. */
     }
 
@@ -131,27 +133,38 @@ int main(int argc, char **argv) {
     while (true) {
         AppEvent ev;
         if (appMonitorPoll(&ev)) {
+            /* Launch: keep the log writer off the SD card until the splash is on screen.
+             * A started splash thread releases the hold; otherwise we release it below. */
+            if (ev.type == AppEvent_Launched)
+                logHold(true);
             logEvent(&ev);
 
             if (ev.type == AppEvent_Launched) {
                 Config cfg;
                 configLoad(&cfg);
                 const bool hbl = ev.has_ams_info && (ev.status.flags & AMS_OVERRIDE_FLAG_HBL);
+                bool started = false;
 
                 if (!cfg.enabled) {
                     logWrite("SPLASH  disabled in config");
                 } else if (hbl && cfg.skip_hbl) {
-                    logWrite("SPLASH  skipped (hbmenu title takeover)");
+                    logWrite("SPLASH  skipped (hbmenu title takeover, skip_hbl=1)");
                 } else if (cfg.test_pattern) {
-                    splashStart(ev.pid, ev.program_id, ev.tick, &cfg, NULL);
+                    started = splashStart(ev.pid, ev.program_id, ev.tick, &cfg, NULL);
                 } else {
                     char path[128];
-                    const SplashImageSource src = splashFindImage(ev.program_id, path, sizeof(path));
-                    if (src == SplashImage_None)
-                        logWrite("SPLASH  no image for %016lX and no default -> no splash", ev.program_id);
+                    const SplashImageSource src = splashFindImage(ev.program_id, hbl, path, sizeof(path));
+                    if (src == SplashImage_Hbl)
+                        cfg.duration_ms = cfg.hbl_duration_ms; /* hbmenu loads much faster */
+                    if (src != SplashImage_None)
+                        started = splashStart(ev.pid, ev.program_id, ev.tick, &cfg, path);
+                    else if (hbl)
+                        logWrite("SPLASH  hbmenu title takeover and no hbl/ image -> no splash");
                     else
-                        splashStart(ev.pid, ev.program_id, ev.tick, &cfg, path);
+                        logWrite("SPLASH  no image for %016lX and no default -> no splash", ev.program_id);
                 }
+                if (!started)
+                    logHold(false);
             } else if (ev.type == AppEvent_Exited) {
                 splashCancel(ev.pid);
             }

@@ -13,7 +13,8 @@ static void setDefaults(Config *c) {
     c->audio_fade_ms    = 500;
     c->fade_ms          = 500;
     c->fade_mode        = FadeMode_Auto;
-    c->skip_hbl         = true;
+    c->skip_hbl         = false; /* hbmenu launches use hbl/ if it exists */
+    c->hbl_duration_ms  = 2500;  /* hbmenu is up much faster than a game */
     c->background       = 0x000000;
     c->home_cancel      = true;
     c->last_frame_stack = false;
@@ -73,6 +74,7 @@ void configLoad(Config *c) {
         if      (!strcmp(key, "enabled"))          c->enabled          = parseBool(val);
         else if (!strcmp(key, "duration_ms"))      c->duration_ms      = strtoul(val, NULL, 10);
         else if (!strcmp(key, "skip_hbl"))         c->skip_hbl         = parseBool(val);
+        else if (!strcmp(key, "hbl_duration_ms"))  c->hbl_duration_ms  = strtoul(val, NULL, 10);
         else if (!strcmp(key, "audio"))            c->audio            = parseBool(val);
         else if (!strcmp(key, "volume"))           c->volume           = strtoul(val, NULL, 10);
         else if (!strcmp(key, "audio_fade_ms"))    c->audio_fade_ms    = strtoul(val, NULL, 10);
@@ -91,6 +93,7 @@ void configLoad(Config *c) {
     if (c->buffers < 1) c->buffers = 1;
     if (c->buffers > 2) c->buffers = 2;
     if (c->duration_ms > 30000) c->duration_ms = 30000;
+    if (c->hbl_duration_ms > 30000) c->hbl_duration_ms = 30000;
     if (c->volume > 100) c->volume = 100;
     if (c->audio_fade_ms > 5000) c->audio_fade_ms = 5000;
     if (c->fade_ms > 5000) c->fade_ms = 5000;

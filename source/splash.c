@@ -303,15 +303,109 @@ static bool drawImage(u16 *fb, PngImage *img) {
         }                                                                 \
     } while (0)
 
+/* ---- Persistent display connection (latency, 2026-11-13) ----
+ * vi:m, the default display and an nvdrv reference are opened on the first splash and kept
+ * for the process lifetime, so later splashes skip reconnecting. Cheap: a few IPC sessions
+ * plus the 0x15000-byte nvdrv transfer memory from the inner heap. The 2 MiB framebuffer
+ * is still acquired and released per splash. */
+static bool g_display_ready = false;
+static ViDisplay g_display;
+
+static Result ensureDisplay(void) {
+    if (g_display_ready)
+        return 0;
+    Result rc = viInitialize(ViServiceType_Manager);
+    if (R_FAILED(rc))
+        return rc;
+    rc = viOpenDefaultDisplay(&g_display);
+    if (R_FAILED(rc)) {
+        viExit();
+        return rc;
+    }
+    /* An extra nvInitialize reference keeps nvdrv open across framebufferCreate/Close. */
+    rc = nvInitialize();
+    if (R_FAILED(rc)) {
+        viCloseDisplay(&g_display);
+        viExit();
+        return rc;
+    }
+    g_display_ready = true;
+    return 0;
+}
+
+/* ---- Decoded-image cache ----
+ * The first launch decodes splash.png (~90 ms) and saves the finished framebuffer next to
+ * it as splash.cache. Later launches read that straight into the framebuffer. The header
+ * ties the cache to the PNG's size + mtime, the background colour and the framebuffer
+ * layout; any mismatch means decode again and rewrite. */
+#define CACHE_MAGIC   0x31435353u /* "SSC1" */
+#define CACHE_VERSION 1u
+
+typedef struct {
+    u32 magic, version;
+    u64 png_size, png_mtime;
+    u32 background, fb_size;
+} CacheHeader;
+
+static void cachePathFor(const char *image_path, char *out, size_t out_size) {
+    snprintf(out, out_size, "%s", image_path);
+    char *slash = strrchr(out, '/');
+    if (slash)
+        snprintf(slash + 1, out_size - (size_t)(slash + 1 - out), "splash.cache");
+}
+
+static bool cacheHeaderFor(const char *image_path, CacheHeader *h) {
+    struct stat st;
+    if (stat(image_path, &st) != 0)
+        return false;
+    memset(h, 0, sizeof(*h));
+    h->magic = CACHE_MAGIC;
+    h->version = CACHE_VERSION;
+    h->png_size = (u64)st.st_size;
+    h->png_mtime = (u64)st.st_mtime;
+    h->background = g_cfg.background;
+    h->fb_size = FB_SIZE;
+    return true;
+}
+
+/* Opens the cache if it matches; returns the FILE positioned at the pixel data, or NULL. */
+static FILE *cacheOpen(const char *cache_path, const CacheHeader *want) {
+    FILE *f = fopen(cache_path, "rb");
+    if (!f)
+        return NULL;
+    CacheHeader have;
+    if (fread(&have, 1, sizeof(have), f) != sizeof(have) || memcmp(&have, want, sizeof(have)) != 0) {
+        fclose(f);
+        return NULL;
+    }
+    return f;
+}
+
+static void cacheWrite(const char *cache_path, const CacheHeader *h, const u16 *px) {
+    char tmp[136];
+    snprintf(tmp, sizeof(tmp), "%s.tmp", cache_path);
+    FILE *f = fopen(tmp, "wb");
+    if (!f)
+        return;
+    const bool ok = fwrite(h, 1, sizeof(*h), f) == sizeof(*h) && fwrite(px, 1, FB_SIZE, f) == FB_SIZE;
+    fclose(f);
+    remove(cache_path);
+    if (!ok || rename(tmp, cache_path) != 0)
+        remove(tmp);
+}
+
 static void splashThread(void *arg) {
     Result rc = 0;
-    ViDisplay display = {0};
     ViLayer layer = {0};
     NWindow win = {0};
     Framebuffer fb = {0};
     PngImage *img = NULL;
+    FILE *cache = NULL;
+    CacheHeader cache_hdr;
+    char cache_path[128] = "";
+    bool cache_valid_hdr = false, need_cache_write = false, log_held = true;
     LayerAlphaMethod alpha_method = LayerAlpha_None;
-    bool vi_init = false, display_open = false, layer_created = false, win_created = false, fb_created = false;
+    bool layer_created = false, win_created = false, fb_created = false;
 
     const u64 t0 = armGetSystemTick();
     const u32 nbuf = g_cfg.buffers;
@@ -324,15 +418,24 @@ static void splashThread(void *arg) {
              g_cfg.audio_fade_ms, g_cfg.fade_ms, g_cfg.fade_mode);
     bool audio_on = false, audio_fade_requested = false;
 
-    /* 0. Validate the image before touching the display, so a bad file never shows anything. */
+    /* 0. Validate the image before touching the display, so a bad file never shows anything.
+     *    A matching cache is the fast path; otherwise the PNG is opened and checked. */
     if (g_has_image) {
-        const PngResult pr = pngOpen(&img, g_image_path);
-        if (pr != PNG_OK) {
-            logWrite("SPLASH  cannot use %s: %s (%d) -> no splash", g_image_path, pngResultString(pr), pr);
-            goto cleanup;
+        cachePathFor(g_image_path, cache_path, sizeof(cache_path));
+        cache_valid_hdr = cacheHeaderFor(g_image_path, &cache_hdr);
+        if (cache_valid_hdr)
+            cache = cacheOpen(cache_path, &cache_hdr);
+        if (!cache) {
+            const PngResult pr = pngOpen(&img, g_image_path);
+            if (pr != PNG_OK) {
+                logWrite("SPLASH  cannot use %s: %s (%d) -> no splash", g_image_path, pngResultString(pr), pr);
+                goto cleanup;
+            }
+            const PngInfo *pi = pngGetInfo(img);
+            logWrite("SPLASH  image %ux%u depth=%u color_type=%u (no valid cache, decoding)",
+                     pi->width, pi->height, pi->bit_depth, pi->color_type);
+            need_cache_write = cache_valid_hdr;
         }
-        const PngInfo *pi = pngGetInfo(img);
-        logWrite("SPLASH  image %ux%u depth=%u color_type=%u", pi->width, pi->height, pi->bit_depth, pi->color_type);
     }
 
     /* 1. Transient memory. */
@@ -343,19 +446,16 @@ static void splashThread(void *arg) {
         goto cleanup;
     }
 
-    /* 2. Layer (libtesla sequence). */
-    STEP(viInitialize(ViServiceType_Manager));
-    vi_init = true;
-    STEP(viOpenDefaultDisplay(&display));
-    display_open = true;
-    STEP(viCreateManagedLayer(&display, (ViLayerFlags)0, 0, &__nx_vi_layer_id));
-    STEP(viCreateLayer(&display, &layer));
+    /* 2. Layer (libtesla sequence) on the persistent display. */
+    STEP(ensureDisplay());
+    STEP(viCreateManagedLayer(&g_display, (ViLayerFlags)0, 0, &__nx_vi_layer_id));
+    STEP(viCreateLayer(&g_display, &layer));
     layer_created = true;
     STEP(viSetLayerScalingMode(&layer, ViScalingMode_FitToLayer));
 
     {
         s32 zmax = -1;
-        const Result rc_max = viGetZOrderCountMax(&display, &zmax);
+        const Result rc_max = viGetZOrderCountMax(&g_display, &zmax);
         const s32 z = (R_SUCCEEDED(rc_max) && zmax > 0) ? zmax : 255;
         rc = viSetLayerZ(&layer, z);
         if (R_FAILED(rc))
@@ -396,21 +496,49 @@ static void splashThread(void *arg) {
     u64 tb = armGetSystemTick();
     u16 *px = framebufferBegin(&fb, NULL);
     bool drawn = true;
-    if (g_has_image)
+    const char *source = "test pattern";
+    if (cache) {
+        drawn = fread(px, 1, FB_SIZE, cache) == FB_SIZE;
+        source = "cache";
+        fclose(cache);
+        cache = NULL;
+        if (!drawn) {
+            /* Unreadable cache: fall back to decoding the PNG now, and rewrite it. */
+            logWrite("SPLASH  cache read failed, decoding PNG instead");
+            drawn = pngOpen(&img, g_image_path) == PNG_OK && drawImage(px, img);
+            need_cache_write = drawn && cache_valid_hdr;
+            source = "png (cache fallback)";
+        }
+    } else if (g_has_image) {
         drawn = drawImage(px, img);
-    else
+        source = "png";
+    } else {
         drawTestScreen(px);
+    }
     if (!drawn)
         memset(px, 0, fb.fb_size); /* fully transparent: present nothing visible */
     framebufferEnd(&fb);
 
     if (!drawn)
         goto cleanup;
-    logWrite("SPLASH  frame presented: draw=%lums, detect->visible=%lums", msSince(tb), msSince(g_launch_tick));
+    logWrite("SPLASH  frame presented from %s: draw=%lums, detect->visible=%lums", source, msSince(tb),
+             msSince(g_launch_tick));
+
+    /* The image is up: the log writer may use the SD card again. */
+    logHold(false);
+    log_held = false;
 
     /* Free the decoder's file handle and buffers while we hold. */
     pngClose(img);
     img = NULL;
+
+    /* First launch with this image: save the finished frame for next time. Done before
+     * the jingle starts so the two never compete for the SD card. */
+    if (need_cache_write) {
+        const u64 tw = armGetSystemTick();
+        cacheWrite(cache_path, &cache_hdr, px);
+        logWrite("SPLASH  cache written: %s (%lums)", cache_path, msSince(tw));
+    }
 
     /* 4. Jingle, started once the image is up so the two line up. */
     if (g_cfg.audio && g_has_image)
@@ -457,13 +585,16 @@ cleanup:
         if (audio_on && !audio_fade_requested)
             audioFadeOut(CANCEL_FADE_MS);
         pngClose(img);
+        if (cache)
+            fclose(cache);
         if (fb_created)    framebufferClose(&fb);
         if (win_created)   nwindowClose(&win);
         if (layer_created) viDestroyManagedLayer(&layer);
         __nx_vi_layer_id = 0;
-        if (display_open)  viCloseDisplay(&display);
-        if (vi_init)       viExit();
+        /* The display connection stays open for the next splash (ensureDisplay). */
         dynheapRelease();
+        if (log_held)
+            logHold(false); /* failed before presenting */
         /* The image is gone; let the jingle finish its fade, then release audout. */
         if (audio_on)
             audioJoin();
@@ -475,8 +606,16 @@ cleanup:
 
 /* ---- public ---- */
 
-SplashImageSource splashFindImage(u64 program_id, char *out, size_t out_size) {
+SplashImageSource splashFindImage(u64 program_id, bool hbl, char *out, size_t out_size) {
     struct stat st;
+
+    if (hbl) {
+        snprintf(out, out_size, SPLASH_ROOT "/hbl/splash.png");
+        if (stat(out, &st) == 0 && S_ISREG(st.st_mode))
+            return SplashImage_Hbl;
+        out[0] = '\0';
+        return SplashImage_None;
+    }
 
     snprintf(out, out_size, SPLASH_ROOT "/%016lX/splash.png", program_id);
     if (stat(out, &st) == 0 && S_ISREG(st.st_mode))

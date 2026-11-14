@@ -17,7 +17,8 @@ typedef struct {
     u32  audio_fade_ms;    /* audio_fade_ms=500: jingle fade when the splash time is up */
     u32  fade_ms;          /* fade_ms=500: image fade-out when the splash time is up (0 = none) */
     FadeMode fade_mode;    /* fade_mode=auto | pixels | none */
-    bool skip_hbl;         /* skip_hbl=1: no splash for hbmenu title takeover */
+    bool skip_hbl;         /* skip_hbl=0: hbmenu title takeover uses hbl/ (if present); 1 = never */
+    u32  hbl_duration_ms;  /* hbl_duration_ms=2500: duration_ms for hbmenu launches (0 = jingle length) */
     u32  background;       /* background=000000 (RRGGBB): letterbox / transparent areas */
     bool home_cancel;      /* home_cancel=1: HOME/power press ends the splash */
     bool last_frame_stack; /* last_frame_stack=0: include the layer in AM's resume snapshot */

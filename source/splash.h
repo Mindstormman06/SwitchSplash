@@ -7,11 +7,14 @@ typedef enum {
     SplashImage_None = 0,
     SplashImage_Title,    /* /config/bootsplash/<TID>/splash.png */
     SplashImage_Default,  /* /config/bootsplash/default/splash.png */
+    SplashImage_Hbl,      /* /config/bootsplash/hbl/splash.png */
 } SplashImageSource;
 
 /* Looks for the title's splash image, then the default one. Writes the path to `out`
- * (empty string when none). Titles with neither get no splash at all. */
-SplashImageSource splashFindImage(u64 program_id, char *out, size_t out_size);
+ * (empty string when none). Titles with neither get no splash at all.
+ * For hbmenu title takeover (`hbl`), only hbl/ is used: hbmenu isn't the game, so it
+ * never gets the game's art or the default. */
+SplashImageSource splashFindImage(u64 program_id, bool hbl, char *out, size_t out_size);
 
 /* Starts the splash for an application on the splash thread. `image_path` NULL means
  * draw the test pattern. Returns false (and logs) if a splash is already running.

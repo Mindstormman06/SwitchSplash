@@ -14,6 +14,11 @@ Hardware status (HOS 21.2.0, 2026-11-13):
 - **Milestone 5:** passed (2026-11-13). Default fade (`fade_mode=auto`) dissolves smoothly
   into the game. Which method `auto` picked isn't logged here yet. Pixel fallback and
   `buffers=2` are untested.
+- **Fast start** (built, not yet tested on hardware): the log is written by a background
+  thread and paused during launch, the display connection stays open between splashes, and
+  decoded images are cached in `splash.cache`. Before this, the splash appeared ~175–210 ms
+  after launch detection. Compare `detect->visible` in the log: the first launch of each image
+  decodes the PNG and writes the cache, and the second launch shows the cached speed.
 
 ## Build
 
@@ -37,8 +42,19 @@ Network/MTP file access can show stale content.
 ```
 sdmc:/config/bootsplash/<TITLE ID>/splash.png   per game, e.g. 0100152000022000/splash.png
 sdmc:/config/bootsplash/default/splash.png      fallback for games without their own
+sdmc:/config/bootsplash/hbl/splash.png          hbmenu via title takeover (game launched holding R)
 ```
 Games with neither get no splash.
+
+A ready-made hbmenu splash is in `art/hbl/`: a still frame of the Homebrew Channel banner and
+its jingle, built from fail0verflow's open-source HBC assets (GPL-2.0, see
+`art/hbl/SOURCE.txt`) with `tools/hbc_banner_to_splash.py`.
+
+hbmenu launches only ever use `hbl/`, never the game's art or `default/`. Without an `hbl/`
+folder they get no splash. `skip_hbl=1` turns hbmenu splashes off even when `hbl/` exists.
+hbmenu splashes use `hbl_duration_ms` (default 2500) instead of `duration_ms`, since hbmenu is
+up much faster than a game. The jingle fades out with the image as usual.
+A `splash.wav` in `hbl/` works like anywhere else.
 
 - **Size:** 1280×720 is shown 1:1. Larger images (e.g. 1920×1080) are scaled down to fit,
   keeping the aspect ratio. Smaller images are centered. Uncovered areas use `background`.
@@ -49,6 +65,12 @@ Games with neither get no splash.
   Smooth gradients stay smooth, but very fine detail may look slightly grainy up close.
 
 Test images: `python tools/make_test_splash.py samples` (already generated in `samples/`).
+
+**`splash.cache`:** the first launch with an image decodes the PNG and saves the finished
+frame next to it as `splash.cache` (~1.9 MB). Later launches load that instead, which is
+quicker than decoding. It's rebuilt automatically when the PNG's size or date changes, or when
+`background` changes. If you replace an image and still see the old one, delete
+`splash.cache`.
 
 ## Jingle
 
