@@ -1,0 +1,9 @@
+splash.png and splash.wav in this folder are derived from the Homebrew Channel's banner
+assets by fail0verflow / Team Twiizers:
+
+  https://github.com/fail0verflow/hbc  (commit 13305cfbe5db47eebc5e62aeed14f7adfbb83a5a)
+  channel/banner/banner/*.png, channel/banner/sound/wiibrew-banner-*-part.wav
+  License: GPL-2.0 (see COPYING in that repository)
+
+Generated with tools/hbc_banner_to_splash.py: one still frame of the animated banner, and the
+banner jingle (intro + one pass of the loop) resampled from 32 kHz to 48 kHz.
