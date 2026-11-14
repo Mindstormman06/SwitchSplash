@@ -66,6 +66,24 @@ A `splash.wav` in `hbl/` works like anywhere else.
 
 Test images: `python tools/make_test_splash.py samples` (already generated in `samples/`).
 
+**Per-game settings:** any folder can hold a `config.ini` with just the keys to change for
+that game. They're layered, each overriding only what it sets:
+
+| Launch | Applied in order |
+|---|---|
+| A game | `config.ini` → `default/config.ini` (only if the default image is shown) → `<TITLE ID>/config.ini` |
+| hbmenu | `config.ini` → `hbl_duration_ms` as the length → `hbl/config.ini` |
+
+A game's own `config.ini` applies even when it has no `splash.png` and uses the default
+image. That way it can, for example, just set `duration_ms=4000`. `enabled=0` in a game's
+folder turns its splash off. The global `enabled=0` turns everything off.
+
+```ini
+; config/bootsplash/0100152000022000/config.ini  (Mario Kart 8 Deluxe)
+duration_ms=5000
+volume=70
+```
+
 **`splash.cache`:** the first launch with an image decodes the PNG and saves the finished
 frame next to it as `splash.cache` (~1.9 MB). Later launches load that instead, which is
 quicker than decoding. It's rebuilt automatically when the PNG's size or date changes, or when

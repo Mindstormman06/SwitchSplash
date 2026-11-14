@@ -10,6 +10,8 @@
  */
 #include <switch.h>
 
+#include <stdio.h>
+
 #include "app_monitor.h"
 #include "config.h"
 #include "focus_watch.h"
@@ -154,9 +156,28 @@ int main(int argc, char **argv) {
                 } else {
                     char path[128];
                     const SplashImageSource src = splashFindImage(ev.program_id, hbl, path, sizeof(path));
-                    if (src == SplashImage_Hbl)
+
+                    /* Per-folder configs, each overriding only the keys it sets:
+                     *   game:   config.ini -> default/config.ini (if the default image is used)
+                     *                      -> <TITLE ID>/config.ini (even without its own image)
+                     *   hbmenu: config.ini -> hbl_duration_ms as duration -> hbl/config.ini */
+                    char cpath[96];
+                    bool any_override = false;
+                    if (hbl) {
                         cfg.duration_ms = cfg.hbl_duration_ms; /* hbmenu loads much faster */
-                    if (src != SplashImage_None)
+                        any_override |= configApply(&cfg, BOOTSPLASH_DIR "/hbl/config.ini");
+                    } else {
+                        if (src == SplashImage_Default)
+                            any_override |= configApply(&cfg, BOOTSPLASH_DIR "/default/config.ini");
+                        snprintf(cpath, sizeof(cpath), BOOTSPLASH_DIR "/%016lX/config.ini", ev.program_id);
+                        any_override |= configApply(&cfg, cpath);
+                    }
+                    if (any_override)
+                        logWrite("SPLASH  per-folder config applied");
+
+                    if (!cfg.enabled)
+                        logWrite("SPLASH  disabled for this title (enabled=0 in its config.ini)");
+                    else if (src != SplashImage_None)
                         started = splashStart(ev.pid, ev.program_id, ev.tick, &cfg, path);
                     else if (hbl)
                         logWrite("SPLASH  hbmenu title takeover and no hbl/ image -> no splash");

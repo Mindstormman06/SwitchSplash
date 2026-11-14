@@ -32,3 +32,7 @@ typedef struct {
 /* Reads config.ini. Missing file/keys -> defaults. Called on every launch so edits
  * apply without a reboot. */
 void configLoad(Config *out);
+
+/* Overlays another config.ini on top (only the keys it sets change). Used for the
+ * per-folder configs: default/, <TITLE ID>/ and hbl/. Returns false if the file is absent. */
+bool configApply(Config *c, const char *path);

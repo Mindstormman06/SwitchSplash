@@ -44,10 +44,13 @@ static u32 parseColor(const char *v) {
 
 void configLoad(Config *c) {
     setDefaults(c);
+    configApply(c, BOOTSPLASH_CONFIG_PATH);
+}
 
-    FILE *f = fopen(BOOTSPLASH_CONFIG_PATH, "r");
+bool configApply(Config *c, const char *path) {
+    FILE *f = fopen(path, "r");
     if (!f)
-        return;
+        return false;
 
     char line[256];
     while (fgets(line, sizeof(line), f)) {
@@ -97,4 +100,5 @@ void configLoad(Config *c) {
     if (c->volume > 100) c->volume = 100;
     if (c->audio_fade_ms > 5000) c->audio_fade_ms = 5000;
     if (c->fade_ms > 5000) c->fade_ms = 5000;
+    return true;
 }
