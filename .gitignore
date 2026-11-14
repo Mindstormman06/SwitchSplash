@@ -3,3 +3,8 @@ out/
 dist/
 *.zip
 logs/
+overlay/build/
+overlay/build.log
+overlay/*.elf
+overlay/*.nacp
+overlay/*.ovl

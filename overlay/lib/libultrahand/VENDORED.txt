@@ -1,0 +1,1 @@
+libultrahand vendored from https://github.com/ppkantorski/libultrahand at commit 548e491e19d791120ad3de05b4a7efea4ca00e34 (2026-11-13). GPL-2.0.

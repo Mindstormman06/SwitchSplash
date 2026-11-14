@@ -37,6 +37,23 @@ it overwrites your settings.
 To read the log, copy it off the SD card directly (card reader or Hekate USB mass storage).
 Network/MTP file access can show stale content.
 
+## Ultrahand overlay
+
+`dist/switch/.overlays/switchsplash.ovl` shows up in Ultrahand's overlay list as
+**SwitchSplash**. It edits the same `config.ini` files: the running game's settings, every
+game folder, global, default and hbmenu, plus sysmodule start/stop and cache clearing.
+Changes apply on the next launch. See [overlay/README.md](overlay/README.md).
+
+**Overlay hardware test** (not yet run):
+1. Open Ultrahand during a game, then **SwitchSplash** → the game is listed under *Running
+   game*. Change *Duration*, close and relaunch the game: the new length is used. Its
+   `config.ini` was created in its folder.
+2. Open the same game again: the changed value is bright, the rest faint (inherited). Pick
+   **Inherit** on it, and it goes faint and shows the global value.
+3. Check that game names show correctly in *Games*.
+4. *Sysmodule* → *Running* off: the next launch has no splash. Turn it on again.
+5. Check B/back navigation and scrolling through a long *Games* list.
+
 ## Splash images
 
 ```
