@@ -6,6 +6,7 @@
  * Layer setup follows libtesla (tesla.hpp, Renderer::init) — see DESIGN.md §4.
  */
 #include "splash.h"
+#include "audio_player.h"
 #include "dynheap.h"
 #include "focus_watch.h"
 #include "image_blit.h"
@@ -37,6 +38,10 @@
 
 #define SPLASH_ROOT "sdmc:/config/bootsplash"
 
+#define DEFAULT_SPLASH_MS 6000   /* duration_ms=0 without a jingle */
+#define MAX_SPLASH_MS     30000  /* upper bound for duration_ms=0 with a jingle */
+#define CANCEL_FADE_MS    100    /* audio fade on HOME / app exit */
+
 extern u64 __nx_vi_layer_id;
 
 static Thread g_thread;
@@ -49,6 +54,7 @@ static u64 g_program_id;
 static u64 g_launch_tick;
 static Config g_cfg;
 static char g_image_path[128];
+static char g_audio_path[128];
 static bool g_has_image;
 
 alignas(0x1000) static u8 g_thread_stack[0x8000];
@@ -124,10 +130,13 @@ typedef enum {
 } HoldResult;
 
 /* Waits up to `ms`, waking early on app exit or when the user leaves the game.
- * `since` is the splash start tick: button presses before it are ignored. */
-static HoldResult holdFor(u32 ms, u64 since) {
+ * `since` is the splash start tick: button presses before it are ignored.
+ * With `until_audio_end`, also returns as soon as the jingle has finished. */
+static HoldResult holdFor(u32 ms, u64 since, bool until_audio_end) {
     const u64 start = armGetSystemTick();
     while (msSince(start) < ms) {
+        if (until_audio_end && !audioIsPlaying())
+            return Hold_Done;
         if (atomic_load(&g_cancel))
             return Hold_AppExited;
         if (g_cfg.home_cancel) {
@@ -191,8 +200,10 @@ static void splashThread(void *arg) {
 
     logWrite("SPLASH  begin tid=%016lX image=%s detect->begin=%lums",
              g_program_id, g_has_image ? g_image_path : "(test pattern)", msSince(g_launch_tick));
-    logWrite("SPLASH  cfg: duration=%ums buffers=%u bg=%06X home_cancel=%d last_frame_stack=%d",
-             g_cfg.duration_ms, nbuf, g_cfg.background, g_cfg.home_cancel, g_cfg.last_frame_stack);
+    logWrite("SPLASH  cfg: duration=%ums buffers=%u bg=%06X home_cancel=%d audio=%d volume=%u fade=%ums",
+             g_cfg.duration_ms, nbuf, g_cfg.background, g_cfg.home_cancel, g_cfg.audio, g_cfg.volume,
+             g_cfg.audio_fade_ms);
+    bool audio_on = false, audio_fade_requested = false;
 
     /* 0. Validate the image before touching the display, so a bad file never shows anything. */
     if (g_has_image) {
@@ -278,16 +289,26 @@ static void splashThread(void *arg) {
     pngClose(img);
     img = NULL;
 
-    /* 4. Hold. */
+    /* 4. Jingle, started once the image is up so the two line up. */
+    if (g_cfg.audio && g_has_image)
+        audio_on = audioStart(g_audio_path, (float)g_cfg.volume / 100.0f);
+
+    /* 5. Hold. duration_ms=0 means "as long as the jingle" (default length without one). */
     {
-        const HoldResult hr = holdFor(g_cfg.duration_ms, t0);
+        const bool until_audio_end = g_cfg.duration_ms == 0 && audio_on;
+        const u32 hold_ms = g_cfg.duration_ms ? g_cfg.duration_ms : (audio_on ? MAX_SPLASH_MS : DEFAULT_SPLASH_MS);
+        const HoldResult hr = holdFor(hold_ms, t0, until_audio_end);
         if (hr != Hold_Done) {
             logWrite("SPLASH  cancelled after %lums: %s", msSince(t0), holdResultName(hr));
-            goto cleanup;
+            goto cleanup; /* cleanup fades the audio out quickly */
+        }
+        if (audio_on && audioIsPlaying()) {
+            audioFadeOut(g_cfg.audio_fade_ms);
+            audio_fade_requested = true;
         }
     }
 
-    /* 5. Optional: present a second frame. With 1 buffer this tells us whether a
+    /* 6. Optional: present a second frame. With 1 buffer this tells us whether a
      *    re-dequeue blocks (needed for the fade in M5). */
     if (g_cfg.test_redraw) {
         logWrite("SPLASH  test_redraw: dequeuing again (buffers=%u)...", nbuf);
@@ -297,12 +318,15 @@ static void splashThread(void *arg) {
         drawTestScreen(px);
         framebufferEnd(&fb);
         logWrite("SPLASH  test_redraw: begin=%lums total=%lums", b2, msSince(tb));
-        holdFor(500, t0);
+        holdFor(500, t0, false);
     }
 
 cleanup:
     {
         const u64 tc = armGetSystemTick();
+        /* Cancelled or failed: a short fade, so the jingle never ends in a click. */
+        if (audio_on && !audio_fade_requested)
+            audioFadeOut(CANCEL_FADE_MS);
         pngClose(img);
         if (fb_created)    framebufferClose(&fb);
         if (win_created)   nwindowClose(&win);
@@ -311,6 +335,9 @@ cleanup:
         if (display_open)  viCloseDisplay(&display);
         if (vi_init)       viExit();
         dynheapRelease();
+        /* The image is gone; let the jingle finish its fade, then release audout. */
+        if (audio_on)
+            audioJoin();
         logWrite("SPLASH  end tid=%016lX teardown=%lums total=%lums", g_program_id, msSince(tc), msSince(t0));
     }
 
@@ -353,8 +380,15 @@ bool splashStart(u64 pid, u64 program_id, u64 launch_tick, const Config *cfg, co
     g_launch_tick = launch_tick;
     g_cfg = *cfg;
     g_has_image = image_path != NULL;
-    if (image_path)
+    g_audio_path[0] = '\0';
+    if (image_path) {
         snprintf(g_image_path, sizeof(g_image_path), "%s", image_path);
+        /* The jingle lives next to the image: <dir>/splash.png -> <dir>/splash.wav */
+        snprintf(g_audio_path, sizeof(g_audio_path), "%s", image_path);
+        char *slash = strrchr(g_audio_path, '/');
+        if (slash)
+            snprintf(slash + 1, sizeof(g_audio_path) - (size_t)(slash + 1 - g_audio_path), "splash.wav");
+    }
     atomic_store(&g_pid, pid);
     atomic_store(&g_cancel, false);
     atomic_store(&g_running, true);

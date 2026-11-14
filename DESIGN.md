@@ -62,6 +62,20 @@ Other sample rates get rejected and logged. Fade-out is a per-sample gain ramp. 
 stereo jingle is about 940 KB on SD and only ~32 KB in RAM. MP3 through dr_mp3 (as in
 sys-tune) is a possible later extra.
 
+*As built* (`wav_stream.c` tested on PC by `tools/pctest/run_wav_tests.py`, `audio_player.c`):
+- **Sample rates:** a fixed-point **linear resampler** handles 8–192 kHz input; I had planned
+  to reject non-48 kHz files. 48 kHz is an exact passthrough.
+- **Input formats:** 16-bit PCM only, including WAVE_FORMAT_EXTENSIBLE. Anything else is
+  rejected with a log line; README gives the ffmpeg command.
+- **Buffers:** 4 × 8 KiB (~170 ms queued) from the inner heap, freed after playback. The
+  buffers are larger than planned to cover SD stalls while the game loads. libnx returns one
+  released buffer per wait, so the loop drains with `audoutGetReleasedAudioOutBuffer`.
+- **Thread:** its own thread at priority 0x2A, above the splash thread. It starts when the
+  image is presented. The jingle comes from the image's folder.
+- **Ending:** a time-up fade of `audio_fade_ms`, or a 100 ms fade on HOME or app exit. The
+  layer is torn down first, then the thread is joined. `duration_ms=0` holds until the
+  jingle ends.
+
 **M5: fade, config, cold launch.** The fade rewrites only the **alpha nibble** of every pixel
 in place: 16 steps, no source image needed. `config.ini` gets a tiny hand-written INI parser
 (`enabled`, `duration_ms`, `fade_ms`, `volume`, `duck_game_audio`, `skip_hbl`). Cold-launch

@@ -2,13 +2,15 @@
 
 Wii U–style per-game boot splash sysmodule for Atmosphère. See [DESIGN.md](DESIGN.md).
 
-Program ID `420000000000B5A5`. Current state: **milestone 3** (per-title PNG).
+Program ID `420000000000B5A5`. Current state: **milestone 4** (jingle playback).
 Hardware status (HOS 21.2.0, 2026-11-13):
 - **Milestone 1:** passed.
 - **Milestone 2:** layer visible over the boot screen, full-screen, premultiplied alpha
   confirmed. HOME cancel works. `buffers=2` and `test_redraw` not yet tested.
 - **Milestone 3:** 1280×720 PNG from `default/` shown correctly, on screen ~180 ms after
-  launch (decode ~88 ms).
+  launch (decode ~88 ms). HOME cancels the splash.
+- **Milestone 4:** passed (2026-11-13). Jingle plays cleanly during load, the fades work,
+  and the game's own audio is unaffected.
 
 ## Build
 
@@ -44,6 +46,44 @@ Games with neither get no splash.
   Smooth gradients stay smooth, but very fine detail may look slightly grainy up close.
 
 Test images: `python tools/make_test_splash.py samples` (already generated in `samples/`).
+
+## Jingle
+
+`splash.wav` in the **same folder as the image** that's shown. A game's own folder uses its
+own jingle (or none); the `default/` image uses `default/splash.wav`. No `splash.wav` means
+a silent splash.
+
+- **Format:** WAV, 16-bit PCM, mono or stereo. 48 kHz plays exactly as-is; other rates
+  are converted on the fly (linear interpolation, fine for a jingle). To convert anything
+  (MP3, OGG, 24-bit, …) with ffmpeg:
+  ```bash
+  ffmpeg -i jingle.mp3 -ar 48000 -ac 2 -c:a pcm_s16le splash.wav
+  ```
+- **Timing:** starts when the image appears. When the splash time is up it fades out over
+  `audio_fade_ms`. HOME or closing the game fades it in 100 ms. `duration_ms=0` makes the
+  splash last exactly as long as the jingle.
+- Played through the system's `audout` service (like sys-tune), separate from the
+  game's audio. System volume and `volume=` in config.ini both apply.
+
+Test jingles: `python tools/make_test_jingle.py samples` (already generated in `samples/`).
+
+## Milestone 4 hardware test
+
+Use the `default/` image you already have.
+1. Copy `samples/jingle_48k_stereo.wav` to `config/bootsplash/default/splash.wav`. Launch a
+   game: a rising 4-note chime starts with the image. It should be clean, with no crackles
+   or stutter, even while the game is loading.
+2. Set `duration_ms=0`: the image disappears right when the chime ends (~3.5 s).
+3. Use `tone_10s_48k.wav` (renamed to `splash.wav`) with `duration_ms=6000`: the image
+   vanishes at 6 s and the tone fades out over half a second after it.
+4. Same tone, press HOME mid-splash: image gone at once, tone fades in ~0.1 s.
+5. Use `jingle_44k1_mono.wav`: same chime as test 1, in both ears, at the same pitch.
+6. Check the game's own audio afterwards: it must play normally (title music, sound effects).
+   This is the key check that we don't disturb its audio init.
+7. Remove `splash.wav`: silent splash, no errors in the log.
+
+The log shows `AUDIO` lines: the file format, `playing (… start took Nms)` and
+`finished after Nms`.
 
 ## Milestone 3 hardware test
 

@@ -5,6 +5,7 @@
  * program ID to sdmc:/config/bootsplash/bootsplash.log.
  * Milestone 2: on launch, show a solid-color full-screen layer for N ms.
  * Milestone 3: per-title PNG from sdmc:/config/bootsplash/<TID>/splash.png (or default/).
+ * Milestone 4: splash.wav next to the image, played through audout with a fade-out.
  */
 #include <switch.h>
 
@@ -115,7 +116,7 @@ int main(int argc, char **argv) {
     logInit();
 
     const u32 hos = hosversionGet();
-    logWrite("----- bootsplash started (milestone 3, build %s %s), HOS %u.%u.%u -----",
+    logWrite("----- bootsplash started (milestone 4, build %s %s), HOS %u.%u.%u -----",
              __DATE__, __TIME__, HOSVER_MAJOR(hos), HOSVER_MINOR(hos), HOSVER_MICRO(hos));
 
     Result rc = appMonitorInitialize();

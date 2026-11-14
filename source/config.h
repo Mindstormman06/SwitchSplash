@@ -5,7 +5,10 @@
 
 typedef struct {
     bool enabled;          /* enabled=1 */
-    u32  duration_ms;      /* duration_ms=6000, measured from launch detection */
+    u32  duration_ms;      /* duration_ms=6000, measured from launch detection; 0 = jingle length */
+    bool audio;            /* audio=1: play splash.wav next to the image */
+    u32  volume;           /* volume=100 (0-100) */
+    u32  audio_fade_ms;    /* audio_fade_ms=500: jingle fade when the splash time is up */
     bool skip_hbl;         /* skip_hbl=1: no splash for hbmenu title takeover */
     u32  background;       /* background=000000 (RRGGBB): letterbox / transparent areas */
     bool home_cancel;      /* home_cancel=1: HOME/power press ends the splash */
