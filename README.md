@@ -2,7 +2,7 @@
 
 Wii U–style per-game boot splash sysmodule for Atmosphère. See [DESIGN.md](DESIGN.md).
 
-Program ID `420000000000B5A5`. Current state: **milestone 4** (jingle playback).
+Program ID `420000000000B5A5`. Current state: **milestone 5** (visual fade-out).
 Hardware status (HOS 21.2.0, 2026-11-13):
 - **Milestone 1:** passed.
 - **Milestone 2:** layer visible over the boot screen, full-screen, premultiplied alpha
@@ -11,6 +11,9 @@ Hardware status (HOS 21.2.0, 2026-11-13):
   launch (decode ~88 ms). HOME cancels the splash.
 - **Milestone 4:** passed (2026-11-13). Jingle plays cleanly during load, the fades work,
   and the game's own audio is unaffected.
+- **Milestone 5:** passed (2026-11-13). Default fade (`fade_mode=auto`) dissolves smoothly
+  into the game. Which method `auto` picked isn't logged here yet. Pixel fallback and
+  `buffers=2` are untested.
 
 ## Build
 
@@ -66,6 +69,23 @@ a silent splash.
   game's audio. System volume and `volume=` in config.ini both apply.
 
 Test jingles: `python tools/make_test_jingle.py samples` (already generated in `samples/`).
+
+## Milestone 5 hardware test (visual fade)
+
+Keep a `default/` image and jingle (the 10 s tone is handy: you can see and hear both fades).
+Default config: `fade_ms=500`, `fade_mode=auto`, `buffers=1`.
+
+1. Launch a game and watch the end of the splash: the image should **dissolve into the game**
+   over about half a second while the jingle fades. The log says which method ran:
+   - `layer alpha via …`, then `fade (layer alpha) N steps`: the smooth fade. This is the best case.
+   - `no layer alpha command worked (…)`: the pixel fallback runs instead, see test 2.
+2. Force the fallback with `fade_mode=pixels` (still `buffers=1`). The log says
+   `fade (pixels, in place)`. Tell me whether you see a 15-step fade, or the image staying
+   fully visible and then vanishing. That shows whether the compositor picks up in-place changes.
+3. `fade_mode=pixels` with `buffers=2`. The log says `fade (pixels, double-buffered)` and
+   `worst dequeue`. Expected: a 15-step fade. This also tests the 4 MiB memory request.
+4. `fade_ms=2000`, back to `auto`: a slow fade, easier to judge for smoothness or stepping.
+5. Press HOME **during** a fade: the image vanishes at once and HOME works normally.
 
 ## Milestone 4 hardware test
 

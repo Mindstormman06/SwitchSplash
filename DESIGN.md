@@ -83,6 +83,24 @@ detection already falls out of M1 (§5). A HOME press during the splash
 (`hidsysAcquireHomeButtonEventHandle`, the same call libtesla uses) cuts the splash
 immediately, so the layer can't cover the HOME menu.
 
+*As built:*
+- **HOME detection:** the hid:sys events must be held for the **process lifetime** on their
+  own thread (`focus_watch.c`). Acquiring them per splash never fired. Tested on hardware.
+- **Fade, preferred path:** the compositor fades the layer, with no redraws and no memory.
+  Switchbrew lists `ISystemDisplayService#2209 SetLayerAlpha` and
+  `IManagerDisplayService#6013 SetLayerOpacity` [13.0.0+], without argument layouts. Both
+  commands are probed with both layouts at alpha 1.0 before the first frame (a wrong layout
+  can't find the layer, so it fails safely), and the first that succeeds drives a ~60 fps
+  fade. *Untested on hardware.*
+- **Fade, fallback:** a premultiplied pixel fade in 15 steps (`fade_pixels.c`). The first
+  plan, alpha nibble only, was wrong for a premultiplied compositor (R4). Each step
+  re-estimates the full-opacity value before scaling, so error stays ≤2/15 at intermediate
+  levels and reaches exactly 0 (PC-tested over every premultiplied pixel value).
+  - `buffers=2`: a real redraw into the back buffer.
+  - `buffers=1`: in place plus cache flush, without a second dequeue (which may block
+    forever). Whether the compositor shows it is a hardware test.
+- `duck_game_audio` isn't implemented. M4 showed no need for it.
+
 **M6: blank the stock logos.** See §7.
 
 ## 3. Memory budget

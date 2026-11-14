@@ -11,6 +11,8 @@ static void setDefaults(Config *c) {
     c->audio            = true;
     c->volume           = 100;
     c->audio_fade_ms    = 500;
+    c->fade_ms          = 500;
+    c->fade_mode        = FadeMode_Auto;
     c->skip_hbl         = true;
     c->background       = 0x000000;
     c->home_cancel      = true;
@@ -74,6 +76,9 @@ void configLoad(Config *c) {
         else if (!strcmp(key, "audio"))            c->audio            = parseBool(val);
         else if (!strcmp(key, "volume"))           c->volume           = strtoul(val, NULL, 10);
         else if (!strcmp(key, "audio_fade_ms"))    c->audio_fade_ms    = strtoul(val, NULL, 10);
+        else if (!strcmp(key, "fade_ms"))          c->fade_ms          = strtoul(val, NULL, 10);
+        else if (!strcmp(key, "fade_mode"))
+            c->fade_mode = !strcmp(val, "pixels") ? FadeMode_Pixels : !strcmp(val, "none") ? FadeMode_None : FadeMode_Auto;
         else if (!strcmp(key, "background"))       c->background       = parseColor(val);
         else if (!strcmp(key, "home_cancel"))      c->home_cancel      = parseBool(val);
         else if (!strcmp(key, "last_frame_stack")) c->last_frame_stack = parseBool(val);
@@ -88,4 +93,5 @@ void configLoad(Config *c) {
     if (c->duration_ms > 30000) c->duration_ms = 30000;
     if (c->volume > 100) c->volume = 100;
     if (c->audio_fade_ms > 5000) c->audio_fade_ms = 5000;
+    if (c->fade_ms > 5000) c->fade_ms = 5000;
 }

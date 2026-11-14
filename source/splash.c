@@ -8,6 +8,7 @@
 #include "splash.h"
 #include "audio_player.h"
 #include "dynheap.h"
+#include "fade_pixels.h"
 #include "focus_watch.h"
 #include "image_blit.h"
 #include "log.h"
@@ -94,6 +95,57 @@ static Result viAddToLayerStack(ViLayer *layer, ViLayerStack stack) {
     return serviceDispatchIn(viGetSession_IManagerDisplayService(), 6000, in);
 }
 
+/* ---- Layer alpha (M5 fade) ----
+ * Switchbrew lists ISystemDisplayService#2209 SetLayerAlpha and IManagerDisplayService
+ * #6013 SetLayerOpacity [13.0.0+], without argument layouts. libnx's SetLayerPosition
+ * (#2201) packs its floats before the layer id, so {f32, pad, u64} is tried first, then
+ * {u64, f32}. A wrong layout fails safely: the float lands in the layer-id slot and the
+ * service can't find that layer. Probed with alpha 1.0 before the first frame. */
+typedef enum {
+    LayerAlpha_None = -1,
+    LayerAlpha_Sys2209_FloatFirst = 0,
+    LayerAlpha_Sys2209_IdFirst,
+    LayerAlpha_Mgr6013_FloatFirst,
+    LayerAlpha_Mgr6013_IdFirst,
+    LayerAlpha_Count,
+} LayerAlphaMethod;
+
+static const char *const g_alpha_method_names[LayerAlpha_Count] = {
+    "ISystemDisplayService#2209 {f32,u64}", "ISystemDisplayService#2209 {u64,f32}",
+    "IManagerDisplayService#6013 {f32,u64}", "IManagerDisplayService#6013 {u64,f32}",
+};
+
+static Result setLayerAlpha(LayerAlphaMethod m, u64 layer_id, float alpha) {
+    const bool sys = m == LayerAlpha_Sys2209_FloatFirst || m == LayerAlpha_Sys2209_IdFirst;
+    Service *s = sys ? viGetSession_ISystemDisplayService() : viGetSession_IManagerDisplayService();
+    const u32 cmd = sys ? 2209 : 6013;
+    if (!s || !serviceIsActive(s))
+        return MAKERESULT(Module_Libnx, LibnxError_NotInitialized);
+    if (m == LayerAlpha_Sys2209_FloatFirst || m == LayerAlpha_Mgr6013_FloatFirst) {
+        const struct { float alpha; u32 pad; u64 layer_id; } in = { alpha, 0, layer_id };
+        return serviceDispatchIn(s, cmd, in);
+    } else {
+        const struct { u64 layer_id; float alpha; u32 pad; } in = { layer_id, alpha, 0 };
+        return serviceDispatchIn(s, cmd, in);
+    }
+}
+
+static LayerAlphaMethod probeLayerAlpha(u64 layer_id) {
+    Result rcs[LayerAlpha_Count] = {0};
+    for (int m = 0; m < LayerAlpha_Count; m++) {
+        if (m == LayerAlpha_Mgr6013_FloatFirst && hosversionBefore(13, 0, 0))
+            break;
+        rcs[m] = setLayerAlpha((LayerAlphaMethod)m, layer_id, 1.0f);
+        if (R_SUCCEEDED(rcs[m])) {
+            logWrite("SPLASH  layer alpha via %s", g_alpha_method_names[m]);
+            return (LayerAlphaMethod)m;
+        }
+    }
+    logWrite("SPLASH  no layer alpha command worked (2209: 0x%x/0x%x, 6013: 0x%x/0x%x)",
+             rcs[0], rcs[1], hosversionAtLeast(13, 0, 0) ? rcs[2] : 0, hosversionAtLeast(13, 0, 0) ? rcs[3] : 0);
+    return LayerAlpha_None;
+}
+
 /* M2 test screen (test_pattern=1). Hardware result 2026-11-13: premultiplied alpha.
  *  A (rows 260-339): white, alpha 0 -> solid white.
  *  B (rows 380-459): red, alpha 8/15 -> see-through red.
@@ -150,6 +202,72 @@ static HoldResult holdFor(u32 ms, u64 since, bool until_audio_end) {
     return Hold_Done;
 }
 
+static bool interrupted(u64 since) {
+    if (atomic_load(&g_cancel))
+        return true;
+    return g_cfg.home_cancel && (focusLastHomeTick() > since || focusLastPowerTick() > since);
+}
+
+/* Fades the splash out over cfg.fade_ms (M5). Returns false if interrupted, in which case
+ * the caller tears the layer down immediately.
+ *  - Layer alpha (if a vi command was found): smooth, ~60 steps, no redraw, no memory.
+ *  - Otherwise pixels, 15 steps (4-bit alpha), premultiplied scaling (fade_pixels.c):
+ *      buffers=2: proper redraw into the back buffer, copying from the presented one.
+ *      buffers=1: in place on the presented buffer + cache flush, no dequeue (a second
+ *                 dequeue of a single buffer may block forever). Whether the compositor
+ *                 picks up the change without a queue is what this build finds out. */
+static bool runFade(Framebuffer *fb, ViLayer *layer, LayerAlphaMethod method, u16 *presented, u64 since) {
+    const u32 ms = g_cfg.fade_ms;
+    if (ms == 0 || g_cfg.fade_mode == FadeMode_None)
+        return true;
+    const u64 start = armGetSystemTick();
+
+    if (method != LayerAlpha_None && g_cfg.fade_mode != FadeMode_Pixels) {
+        u32 steps = 0;
+        for (;;) {
+            const u64 t = msSince(start);
+            const float a = t >= ms ? 0.0f : 1.0f - (float)t / (float)ms;
+            setLayerAlpha(method, layer->layer_id, a);
+            steps++;
+            if (t >= ms)
+                break;
+            if (interrupted(since))
+                return false;
+            svcSleepThread(16000000ULL); /* ~one frame */
+        }
+        logWrite("SPLASH  fade (layer alpha) %u steps in %lums", steps, msSince(start));
+        return true;
+    }
+
+    const size_t count = fb->fb_size / sizeof(u16);
+    const u64 step_ns = (u64)ms * 1000000ULL / 15;
+    u16 *src = presented;
+    u64 worst_begin = 0;
+    for (unsigned level = 15; level > 0; level--) {
+        if (interrupted(since))
+            return false;
+        const u64 ts = armGetSystemTick();
+        if (fb->num_fbs >= 2) {
+            const u64 tb = armGetSystemTick();
+            u16 *dst = framebufferBegin(fb, NULL);
+            const u64 b = msSince(tb);
+            if (b > worst_begin) worst_begin = b;
+            fadeScale4444(dst, src, count, level, level - 1);
+            framebufferEnd(fb);
+            src = dst;
+        } else {
+            fadeScale4444(presented, presented, count, level, level - 1);
+            armDCacheFlush(presented, fb->fb_size);
+        }
+        const u64 spent = armTicksToNs(armGetSystemTick() - ts);
+        if (spent < step_ns)
+            svcSleepThread(step_ns - spent);
+    }
+    logWrite("SPLASH  fade (pixels, %s) 15 steps in %lums, worst dequeue %lums",
+             fb->num_fbs >= 2 ? "double-buffered" : "in place", msSince(start), worst_begin);
+    return true;
+}
+
 static const char *holdResultName(HoldResult r) {
     switch (r) {
         case Hold_AppExited:     return "application exited";
@@ -192,6 +310,7 @@ static void splashThread(void *arg) {
     NWindow win = {0};
     Framebuffer fb = {0};
     PngImage *img = NULL;
+    LayerAlphaMethod alpha_method = LayerAlpha_None;
     bool vi_init = false, display_open = false, layer_created = false, win_created = false, fb_created = false;
 
     const u64 t0 = armGetSystemTick();
@@ -200,9 +319,9 @@ static void splashThread(void *arg) {
 
     logWrite("SPLASH  begin tid=%016lX image=%s detect->begin=%lums",
              g_program_id, g_has_image ? g_image_path : "(test pattern)", msSince(g_launch_tick));
-    logWrite("SPLASH  cfg: duration=%ums buffers=%u bg=%06X home_cancel=%d audio=%d volume=%u fade=%ums",
+    logWrite("SPLASH  cfg: duration=%ums buffers=%u bg=%06X home_cancel=%d audio=%d volume=%u audio_fade=%ums fade=%ums mode=%d",
              g_cfg.duration_ms, nbuf, g_cfg.background, g_cfg.home_cancel, g_cfg.audio, g_cfg.volume,
-             g_cfg.audio_fade_ms);
+             g_cfg.audio_fade_ms, g_cfg.fade_ms, g_cfg.fade_mode);
     bool audio_on = false, audio_fade_requested = false;
 
     /* 0. Validate the image before touching the display, so a bad file never shows anything. */
@@ -268,6 +387,10 @@ static void splashThread(void *arg) {
     }
     logWrite("SPLASH  layer ready in %lums", msSince(t0));
 
+    /* Find a working layer-alpha command now, at alpha 1.0, so nothing visible changes. */
+    if (g_cfg.fade_ms > 0 && g_cfg.fade_mode == FadeMode_Auto)
+        alpha_method = probeLayerAlpha(layer.layer_id);
+
     /* 3. Draw one frame. The buffer is dequeued for the whole decode, so nothing partial
      *    is ever shown; until framebufferEnd the stock boot screen stays visible. */
     u64 tb = armGetSystemTick();
@@ -308,8 +431,14 @@ static void splashThread(void *arg) {
         }
     }
 
-    /* 6. Optional: present a second frame. With 1 buffer this tells us whether a
-     *    re-dequeue blocks (needed for the fade in M5). */
+    /* 6. Fade the image out alongside the jingle. */
+    if (!runFade(&fb, &layer, alpha_method, px, t0)) {
+        logWrite("SPLASH  fade interrupted after %lums", msSince(t0));
+        goto cleanup;
+    }
+
+    /* 7. Optional: present a second frame. With 1 buffer this tells us whether a
+     *    re-dequeue blocks. */
     if (g_cfg.test_redraw) {
         logWrite("SPLASH  test_redraw: dequeuing again (buffers=%u)...", nbuf);
         tb = armGetSystemTick();
