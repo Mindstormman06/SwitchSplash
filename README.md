@@ -70,6 +70,21 @@ a silent splash.
 
 Test jingles: `python tools/make_test_jingle.py samples` (already generated in `samples/`).
 
+## Using a Wii U game's original boot splash
+
+For Wii U games you own and have extracted (e.g. for Cemu), the `meta/` folder holds
+`bootTvTex.tga` (the 1280×720 TV splash) and `bootSound.btsnd` (the boot music). To convert
+them:
+```bash
+python tools/wiiu_boot_to_splash.py "<extracted game>/meta" art/<SWITCH TITLE ID>
+```
+Then copy `art/<TITLE ID>/` to `sdmc:/config/bootsplash/<TITLE ID>/`. Use the **Switch**
+version's title ID (e.g. Mario Kart 8 Deluxe = `0100152000022000`).
+
+`art/` is git-ignored so Nintendo's assets don't end up in the repo. Wii U boot sounds are
+background loops (often ~20 s) rather than short jingles, so keep a fixed `duration_ms`
+rather than `0`. `--max-seconds N` cuts the sound with a short fade if you want a shorter file.
+
 ## Milestone 5 hardware test (visual fade)
 
 Keep a `default/` image and jingle (the 10 s tone is handy: you can see and hear both fades).
