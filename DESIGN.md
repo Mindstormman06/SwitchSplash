@@ -38,9 +38,21 @@ The splash runs in its own thread so the monitor keeps polling.
 a 32 KB window) feeding row unfiltering with a single previous-row buffer. Each row is converted
 to RGBA4444 with a 4×4 ordered dither (hides 12-bit banding) and written straight into the
 swizzled framebuffer. There is never a full-image copy. stb_image and lodepng were ruled out
-because they inflate the whole IDAT into RAM (~3.7 MB for 720p). Supported input:
-non-interlaced 8-bit gray, RGB, RGBA and palette PNGs. Anything other than 1280×720 is
-centered or cropped (scaling can come later).
+because they inflate the whole IDAT into RAM (~3.7 MB for 720p).
+
+*As built* (`png_stream.c`, `image_blit.c`, tested on PC against PIL by `tools/pctest/`):
+- **Input:** every non-interlaced PNG type (gray/RGB/palette/GA/RGBA, 1–16 bit, PLTE,
+  tRNS), up to 4096×4096. Adam7 interlacing is rejected with a log message.
+- **Placement:** images up to 1280×720 are centered at 1:1. Larger ones are scaled down
+  to fit with area averaging, done row by row with one accumulator row (~25 KB), so a
+  1920×1080 image works. Letterbox areas use `background`.
+- **Transparency** is composited over `background`, so the output is always opaque.
+  Colors are premultiplied, matching the compositor (R4).
+- **Timing:** the PNG header is validated *before* the heap and layer are set up, so a bad
+  file shows nothing. The decode runs into the dequeued buffer before the first present, so
+  there's no second draw (single-buffer redraw R2 isn't needed) and nothing partial is shown.
+- **Memory:** inner heap only. tinfl ~11 KB, dict 32 KB, input 8 KB, 2 rows (≤ 64 KB
+  at 4096 px RGBA16), RGBA row ≤ 16 KB, blitter ~28 KB.
 
 **M4: audio.** `audoutInitialize` → `audoutStartAudioOut` → about 4 × 8 KB
 `AudioOutBuffer`s (0x1000-aligned) streamed from SD → `audoutStopAudioOut` → `audoutExit`.

@@ -1,15 +1,21 @@
 /*
- * Splash layer. Milestone 2: a full-screen solid color (plus alpha test stripes) in a
- * managed vi layer above everything, held for N ms, then destroyed.
+ * Splash layer.
+ *  M2: managed vi layer above everything, held for N ms, then destroyed.
+ *  M3: per-title PNG, decoded row by row straight into the framebuffer.
  *
  * Layer setup follows libtesla (tesla.hpp, Renderer::init) — see DESIGN.md §4.
  */
 #include "splash.h"
 #include "dynheap.h"
+#include "focus_watch.h"
+#include "image_blit.h"
 #include "log.h"
+#include "png_stream.h"
 
 #include <stdatomic.h>
+#include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 
 /* Framebuffer resolution. */
 #define SCREEN_W 1280
@@ -18,8 +24,9 @@
 
 /* vi layer coordinates are in 1920x1080 display space (libtesla cfg::ScreenWidth/
  * ScreenHeight). Confirmed on hardware: a 1280x720 layer covered only the top-left 2/3.
- * FitToLayer scales the 1280x720 framebuffer up to fill it. Size comes from config
- * (layer_w/layer_h, default 1920x1080) while we diagnose load-time visibility. */
+ * FitToLayer scales the 1280x720 framebuffer up to fill it. */
+#define LAYER_W 1920
+#define LAYER_H 1080
 
 /* Must match libnx framebufferCreate's alignment (verified by disassembly):
  * stride 64-byte aligned, height 128-row aligned, block-linear with 16-GOB blocks. */
@@ -27,6 +34,8 @@
 #define FB_HEIGHT_AL  ((SCREEN_H + 127) & ~127)
 #define FB_SIZE       (FB_STRIDE * FB_HEIGHT_AL)
 #define GOBS_PER_ROW  (FB_STRIDE / 64)
+
+#define SPLASH_ROOT "sdmc:/config/bootsplash"
 
 extern u64 __nx_vi_layer_id;
 
@@ -39,6 +48,8 @@ static atomic_ullong g_pid = 0;
 static u64 g_program_id;
 static u64 g_launch_tick;
 static Config g_cfg;
+static char g_image_path[128];
+static bool g_has_image;
 
 alignas(0x1000) static u8 g_thread_stack[0x8000];
 
@@ -77,33 +88,32 @@ static Result viAddToLayerStack(ViLayer *layer, ViLayerStack stack) {
     return serviceDispatchIn(viGetSession_IManagerDisplayService(), 6000, in);
 }
 
+/* M2 test screen (test_pattern=1). Hardware result 2026-11-13: premultiplied alpha.
+ *  A (rows 260-339): white, alpha 0 -> solid white.
+ *  B (rows 380-459): red, alpha 8/15 -> see-through red.
+ *  C (bottom-right box): black, alpha 0 -> fully transparent (boot logo visible). */
 static void drawTestScreen(u16 *fb) {
-    const u16 bg = rgba4444((g_cfg.color >> 16) & 0xFF, (g_cfg.color >> 8) & 0xFF, g_cfg.color & 0xFF, 0xF);
-
-    /* Alpha test (DESIGN.md risk R4). First hardware run (2026-11-13): stripe A was solid
-     * white, so the compositor is NOT straight-alpha. Box C tells the remaining two apart.
-     *  A (rows 260-339): white, alpha 0.  Seen as solid white.
-     *  B (rows 380-459): red, alpha 8/15. Seen as solid bright red (over a black background).
-     *  C (bottom-right box, over the stock "NINTENDO SWITCH" logo): black, alpha 0.
-     *      Logo visible through it -> premultiplied alpha (transparency works).
-     *      Solid black            -> alpha is ignored, the layer is opaque. */
+    const u16 bg       = rgba4444(0x20, 0x30, 0x60, 0xF);
     const u16 stripe_a = rgba4444(0xFF, 0xFF, 0xFF, 0x0);
     const u16 stripe_b = rgba4444(0xFF, 0x00, 0x00, 0x8);
     const u16 box_c    = rgba4444(0x00, 0x00, 0x00, 0x0);
 
     for (u32 y = 0; y < SCREEN_H; y++) {
         u16 row = bg;
-        if (g_cfg.alpha_test) {
-            if (y >= 260 && y < 340) row = stripe_a;
-            else if (y >= 380 && y < 460) row = stripe_b;
-        }
-        for (u32 x = 0; x < SCREEN_W; x++) {
-            u16 c = row;
-            if (g_cfg.alpha_test && x >= 900 && y >= 560)
-                c = box_c;
-            fb[pixelOffset(x, y)] = c;
-        }
+        if (y >= 260 && y < 340) row = stripe_a;
+        else if (y >= 380 && y < 460) row = stripe_b;
+        for (u32 x = 0; x < SCREEN_W; x++)
+            fb[pixelOffset(x, y)] = (x >= 900 && y >= 560) ? box_c : row;
     }
+}
+
+/* Blitter output -> swizzled framebuffer. */
+static void storeRowToFb(void *user, uint32_t y, const uint16_t *row) {
+    u16 *fb = user;
+    if (y >= SCREEN_H)
+        return;
+    for (u32 x = 0; x < SCREEN_W; x++)
+        fb[pixelOffset(x, y)] = row[x];
 }
 
 typedef enum {
@@ -113,61 +123,48 @@ typedef enum {
     Hold_PowerPressed,
 } HoldResult;
 
-/* HOME/power button events (libtesla backgroundEventPoller pattern). The splash must
- * never cover the HOME menu, so either press ends it immediately. */
-static Event g_home_event, g_power_event;
-static bool g_hidsys_init = false, g_home_valid = false, g_power_valid = false;
-
-static void buttonEventsOpen(void) {
-    if (R_FAILED(hidsysInitialize())) {
-        logWrite("SPLASH  hidsysInitialize failed: HOME won't cancel the splash");
-        return;
-    }
-    g_hidsys_init = true;
-    g_home_valid = R_SUCCEEDED(hidsysAcquireHomeButtonEventHandle(&g_home_event, false));
-    g_power_valid = R_SUCCEEDED(hidsysAcquireSleepButtonEventHandle(&g_power_event, false));
-    /* Drop any press that happened before the splash started. */
-    if (g_home_valid) eventClear(&g_home_event);
-    if (g_power_valid) eventClear(&g_power_event);
-    if (!g_home_valid || !g_power_valid)
-        logWrite("SPLASH  button events: home=%d power=%d", g_home_valid, g_power_valid);
-}
-
-static void buttonEventsClose(void) {
-    if (g_home_valid) eventClose(&g_home_event);
-    if (g_power_valid) eventClose(&g_power_event);
-    if (g_hidsys_init)
-        hidsysExit();
-    g_hidsys_init = g_home_valid = g_power_valid = false;
-}
-
-/* Waits up to `ms`, waking early on app exit or HOME/power press. */
-static HoldResult holdFor(u32 ms) {
+/* Waits up to `ms`, waking early on app exit or when the user leaves the game.
+ * `since` is the splash start tick: button presses before it are ignored. */
+static HoldResult holdFor(u32 ms, u64 since) {
     const u64 start = armGetSystemTick();
     while (msSince(start) < ms) {
         if (atomic_load(&g_cancel))
             return Hold_AppExited;
-        if (g_home_valid && R_SUCCEEDED(eventWait(&g_home_event, 0)))
-            return Hold_HomePressed;
-        if (g_power_valid && R_SUCCEEDED(eventWait(&g_power_event, 0)))
-            return Hold_PowerPressed;
-
-        /* Sleep on whichever event is available, so a press wakes us instantly. */
-        if (g_home_valid)
-            eventWait(&g_home_event, 10000000ULL);
-        else
-            svcSleepThread(10000000ULL);
+        if (g_cfg.home_cancel) {
+            if (focusLastHomeTick() > since)
+                return Hold_HomePressed;
+            if (focusLastPowerTick() > since)
+                return Hold_PowerPressed;
+        }
+        svcSleepThread(10000000ULL);
     }
     return Hold_Done;
 }
 
 static const char *holdResultName(HoldResult r) {
     switch (r) {
-        case Hold_AppExited:    return "application exited";
-        case Hold_HomePressed:  return "HOME pressed";
-        case Hold_PowerPressed: return "power button pressed";
-        default:                return "done";
+        case Hold_AppExited:     return "application exited";
+        case Hold_HomePressed:   return "HOME pressed";
+        case Hold_PowerPressed:  return "power button pressed";
+        default:                 return "done";
     }
+}
+
+/* Decodes the PNG into the (dequeued) framebuffer. Returns false on error. */
+static bool drawImage(u16 *fb, PngImage *img) {
+    const PngInfo *info = pngGetInfo(img);
+    Blitter blit;
+    if (!blitInit(&blit, SCREEN_W, SCREEN_H, info->width, info->height, g_cfg.background, storeRowToFb, fb)) {
+        logWrite("SPLASH  blitter out of memory");
+        return false;
+    }
+    const PngResult r = pngDecode(img, blitPngRow, &blit);
+    if (r == PNG_OK)
+        blitFinish(&blit);
+    else
+        logWrite("SPLASH  PNG decode failed: %s (%d)", pngResultString(r), r);
+    blitFree(&blit);
+    return r == PNG_OK;
 }
 
 #define STEP(call)                                                        \
@@ -185,22 +182,28 @@ static void splashThread(void *arg) {
     ViLayer layer = {0};
     NWindow win = {0};
     Framebuffer fb = {0};
+    PngImage *img = NULL;
     bool vi_init = false, display_open = false, layer_created = false, win_created = false, fb_created = false;
 
     const u64 t0 = armGetSystemTick();
     const u32 nbuf = g_cfg.buffers;
     const size_t fb_total = ((size_t)FB_SIZE * nbuf + 0xFFF) & ~0xFFFUL;
 
-    logWrite("SPLASH  begin tid=%016lX buffers=%u fb=%u bytes (%lu total) detect->begin=%lums",
-             g_program_id, nbuf, (u32)FB_SIZE, (unsigned long)fb_total, msSince(g_launch_tick));
+    logWrite("SPLASH  begin tid=%016lX image=%s detect->begin=%lums",
+             g_program_id, g_has_image ? g_image_path : "(test pattern)", msSince(g_launch_tick));
+    logWrite("SPLASH  cfg: duration=%ums buffers=%u bg=%06X home_cancel=%d last_frame_stack=%d",
+             g_cfg.duration_ms, nbuf, g_cfg.background, g_cfg.home_cancel, g_cfg.last_frame_stack);
 
-    logWrite("SPLASH  cfg: duration=%ums layer=%ux%u home_cancel=%d last_frame_stack=%d alpha_test=%d",
-             g_cfg.duration_ms, g_cfg.layer_w, g_cfg.layer_h, g_cfg.home_cancel,
-             g_cfg.last_frame_stack, g_cfg.alpha_test);
-
-    /* 0. Listen for HOME/power before anything is on screen. */
-    if (g_cfg.home_cancel)
-        buttonEventsOpen();
+    /* 0. Validate the image before touching the display, so a bad file never shows anything. */
+    if (g_has_image) {
+        const PngResult pr = pngOpen(&img, g_image_path);
+        if (pr != PNG_OK) {
+            logWrite("SPLASH  cannot use %s: %s (%d) -> no splash", g_image_path, pngResultString(pr), pr);
+            goto cleanup;
+        }
+        const PngInfo *pi = pngGetInfo(img);
+        logWrite("SPLASH  image %ux%u depth=%u color_type=%u", pi->width, pi->height, pi->bit_depth, pi->color_type);
+    }
 
     /* 1. Transient memory. */
     rc = dynheapAcquire(fb_total);
@@ -209,7 +212,6 @@ static void splashThread(void *arg) {
                  (unsigned long)fb_total, rc);
         goto cleanup;
     }
-    logWrite("SPLASH  heap acquired: %lu KiB in %lums", (unsigned long)(dynheapSize() / 1024), msSince(t0));
 
     /* 2. Layer (libtesla sequence). */
     STEP(viInitialize(ViServiceType_Manager));
@@ -222,17 +224,12 @@ static void splashThread(void *arg) {
     STEP(viSetLayerScalingMode(&layer, ViScalingMode_FitToLayer));
 
     {
-        s32 zmin = -1, zmax = -1, rw = 0, rh = 0, lw = 0, lh = 0;
-        const Result rc_min = viGetZOrderCountMin(&display, &zmin);
+        s32 zmax = -1;
         const Result rc_max = viGetZOrderCountMax(&display, &zmax);
-        const Result rc_res = viGetDisplayResolution(&display, &rw, &rh);
-        const Result rc_lres = viGetDisplayLogicalResolution(&display, &lw, &lh);
-        logWrite("SPLASH  display: zmin=%d (0x%x) zmax=%d (0x%x) res=%dx%d (0x%x) logical=%dx%d (0x%x)",
-                 zmin, rc_min, zmax, rc_max, rw, rh, rc_res, lw, lh, rc_lres);
-
-        s32 z = (R_SUCCEEDED(rc_max) && zmax > 0) ? zmax : 255;
+        const s32 z = (R_SUCCEEDED(rc_max) && zmax > 0) ? zmax : 255;
         rc = viSetLayerZ(&layer, z);
-        logWrite("SPLASH  layer id=%lu z=%d (setZ rc=0x%x)", layer.layer_id, z, rc);
+        if (R_FAILED(rc))
+            logWrite("SPLASH  viSetLayerZ(%d) failed: 0x%x", z, rc);
     }
 
     static const ViLayerStack stacks[] = {
@@ -247,32 +244,43 @@ static void splashThread(void *arg) {
             logWrite("SPLASH  AddToLayerStack(%d) failed: 0x%x", stacks[i], rc);
     }
 
-    STEP(viSetLayerSize(&layer, g_cfg.layer_w, g_cfg.layer_h));
+    STEP(viSetLayerSize(&layer, LAYER_W, LAYER_H));
     STEP(viSetLayerPosition(&layer, 0.0f, 0.0f));
     STEP(nwindowCreateFromLayer(&win, &layer));
     win_created = true;
     STEP(framebufferCreate(&fb, &win, SCREEN_W, SCREEN_H, PIXEL_FORMAT_RGBA_4444, nbuf));
     fb_created = true;
-    logWrite("SPLASH  layer+framebuffer ready in %lums (fb_size=%u, expected %u)",
-             msSince(t0), fb.fb_size, (u32)FB_SIZE);
 
     if (fb.fb_size != FB_SIZE) {
-        logWrite("SPLASH  fb_size mismatch, swizzle would be wrong -> aborting");
+        logWrite("SPLASH  fb_size mismatch (%u != %u), swizzle would be wrong -> aborting", fb.fb_size, (u32)FB_SIZE);
         goto cleanup;
     }
+    logWrite("SPLASH  layer ready in %lums", msSince(t0));
 
-    /* 3. Draw one frame. */
+    /* 3. Draw one frame. The buffer is dequeued for the whole decode, so nothing partial
+     *    is ever shown; until framebufferEnd the stock boot screen stays visible. */
     u64 tb = armGetSystemTick();
     u16 *px = framebufferBegin(&fb, NULL);
-    const u64 begin_ms = msSince(tb);
-    drawTestScreen(px);
+    bool drawn = true;
+    if (g_has_image)
+        drawn = drawImage(px, img);
+    else
+        drawTestScreen(px);
+    if (!drawn)
+        memset(px, 0, fb.fb_size); /* fully transparent: present nothing visible */
     framebufferEnd(&fb);
-    logWrite("SPLASH  frame presented: begin=%lums draw+end=%lums, detect->visible=%lums",
-             begin_ms, msSince(tb) - begin_ms, msSince(g_launch_tick));
+
+    if (!drawn)
+        goto cleanup;
+    logWrite("SPLASH  frame presented: draw=%lums, detect->visible=%lums", msSince(tb), msSince(g_launch_tick));
+
+    /* Free the decoder's file handle and buffers while we hold. */
+    pngClose(img);
+    img = NULL;
 
     /* 4. Hold. */
     {
-        const HoldResult hr = holdFor(g_cfg.duration_ms);
+        const HoldResult hr = holdFor(g_cfg.duration_ms, t0);
         if (hr != Hold_Done) {
             logWrite("SPLASH  cancelled after %lums: %s", msSince(t0), holdResultName(hr));
             goto cleanup;
@@ -289,12 +297,13 @@ static void splashThread(void *arg) {
         drawTestScreen(px);
         framebufferEnd(&fb);
         logWrite("SPLASH  test_redraw: begin=%lums total=%lums", b2, msSince(tb));
-        holdFor(500);
+        holdFor(500, t0);
     }
 
 cleanup:
     {
         const u64 tc = armGetSystemTick();
+        pngClose(img);
         if (fb_created)    framebufferClose(&fb);
         if (win_created)   nwindowClose(&win);
         if (layer_created) viDestroyManagedLayer(&layer);
@@ -302,7 +311,6 @@ cleanup:
         if (display_open)  viCloseDisplay(&display);
         if (vi_init)       viExit();
         dynheapRelease();
-        buttonEventsClose();
         logWrite("SPLASH  end tid=%016lX teardown=%lums total=%lums", g_program_id, msSince(tc), msSince(t0));
     }
 
@@ -310,6 +318,21 @@ cleanup:
 }
 
 /* ---- public ---- */
+
+SplashImageSource splashFindImage(u64 program_id, char *out, size_t out_size) {
+    struct stat st;
+
+    snprintf(out, out_size, SPLASH_ROOT "/%016lX/splash.png", program_id);
+    if (stat(out, &st) == 0 && S_ISREG(st.st_mode))
+        return SplashImage_Title;
+
+    snprintf(out, out_size, SPLASH_ROOT "/default/splash.png");
+    if (stat(out, &st) == 0 && S_ISREG(st.st_mode))
+        return SplashImage_Default;
+
+    out[0] = '\0';
+    return SplashImage_None;
+}
 
 void splashReap(void) {
     if (g_thread_created && !atomic_load(&g_running)) {
@@ -319,7 +342,7 @@ void splashReap(void) {
     }
 }
 
-bool splashStart(u64 pid, u64 program_id, u64 launch_tick, const Config *cfg) {
+bool splashStart(u64 pid, u64 program_id, u64 launch_tick, const Config *cfg, const char *image_path) {
     splashReap();
     if (g_thread_created) {
         logWrite("SPLASH  already running, ignoring launch of %016lX", program_id);
@@ -329,6 +352,9 @@ bool splashStart(u64 pid, u64 program_id, u64 launch_tick, const Config *cfg) {
     g_program_id = program_id;
     g_launch_tick = launch_tick;
     g_cfg = *cfg;
+    g_has_image = image_path != NULL;
+    if (image_path)
+        snprintf(g_image_path, sizeof(g_image_path), "%s", image_path);
     atomic_store(&g_pid, pid);
     atomic_store(&g_cancel, false);
     atomic_store(&g_running, true);

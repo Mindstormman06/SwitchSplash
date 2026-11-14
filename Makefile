@@ -20,7 +20,7 @@ PROGRAM_ID	:=	420000000000B5A5
 BUILD		:=	build
 OUTDIR		:=	out
 DISTDIR		:=	dist
-SOURCES		:=	source
+SOURCES		:=	source source/miniz
 DATA		:=
 INCLUDES	:=	source
 

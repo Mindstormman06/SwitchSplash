@@ -4,11 +4,13 @@
  * Milestone 1: boot, poll pm for application launches, log each launch/exit with its
  * program ID to sdmc:/config/bootsplash/bootsplash.log.
  * Milestone 2: on launch, show a solid-color full-screen layer for N ms.
+ * Milestone 3: per-title PNG from sdmc:/config/bootsplash/<TID>/splash.png (or default/).
  */
 #include <switch.h>
 
 #include "app_monitor.h"
 #include "config.h"
+#include "focus_watch.h"
 #include "log.h"
 #include "splash.h"
 
@@ -113,7 +115,7 @@ int main(int argc, char **argv) {
     logInit();
 
     const u32 hos = hosversionGet();
-    logWrite("----- bootsplash started (milestone 2, build %s %s), HOS %u.%u.%u -----",
+    logWrite("----- bootsplash started (milestone 3, build %s %s), HOS %u.%u.%u -----",
              __DATE__, __TIME__, HOSVER_MAJOR(hos), HOSVER_MINOR(hos), HOSVER_MICRO(hos));
 
     Result rc = appMonitorInitialize();
@@ -121,6 +123,8 @@ int main(int argc, char **argv) {
         logWrite("FATAL appMonitorInitialize failed: 0x%x", rc);
         return 0; /* Exit quietly rather than crash the console. */
     }
+
+    focusWatchStart();
 
     while (true) {
         AppEvent ev;
@@ -132,12 +136,20 @@ int main(int argc, char **argv) {
                 configLoad(&cfg);
                 const bool hbl = ev.has_ams_info && (ev.status.flags & AMS_OVERRIDE_FLAG_HBL);
 
-                if (!cfg.enabled)
+                if (!cfg.enabled) {
                     logWrite("SPLASH  disabled in config");
-                else if (hbl && cfg.skip_hbl)
+                } else if (hbl && cfg.skip_hbl) {
                     logWrite("SPLASH  skipped (hbmenu title takeover)");
-                else
-                    splashStart(ev.pid, ev.program_id, ev.tick, &cfg);
+                } else if (cfg.test_pattern) {
+                    splashStart(ev.pid, ev.program_id, ev.tick, &cfg, NULL);
+                } else {
+                    char path[128];
+                    const SplashImageSource src = splashFindImage(ev.program_id, path, sizeof(path));
+                    if (src == SplashImage_None)
+                        logWrite("SPLASH  no image for %016lX and no default -> no splash", ev.program_id);
+                    else
+                        splashStart(ev.pid, ev.program_id, ev.tick, &cfg, path);
+                }
             } else if (ev.type == AppEvent_Exited) {
                 splashCancel(ev.pid);
             }

@@ -3,10 +3,20 @@
 
 #include "config.h"
 
-/* Starts the splash for an application on the splash thread. Returns false (and logs)
- * if a splash is already running. `launch_tick` is when the launch was observed and is
- * used to log latency. */
-bool splashStart(u64 pid, u64 program_id, u64 launch_tick, const Config *cfg);
+typedef enum {
+    SplashImage_None = 0,
+    SplashImage_Title,    /* /config/bootsplash/<TID>/splash.png */
+    SplashImage_Default,  /* /config/bootsplash/default/splash.png */
+} SplashImageSource;
+
+/* Looks for the title's splash image, then the default one. Writes the path to `out`
+ * (empty string when none). Titles with neither get no splash at all. */
+SplashImageSource splashFindImage(u64 program_id, char *out, size_t out_size);
+
+/* Starts the splash for an application on the splash thread. `image_path` NULL means
+ * draw the test pattern. Returns false (and logs) if a splash is already running.
+ * `launch_tick` is when the launch was observed and is used to log latency. */
+bool splashStart(u64 pid, u64 program_id, u64 launch_tick, const Config *cfg, const char *image_path);
 
 /* Asks a running splash for `pid` to tear down early (the app exited). */
 void splashCancel(u64 pid);
