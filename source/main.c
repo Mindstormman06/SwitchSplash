@@ -151,7 +151,7 @@ int main(int argc, char **argv) {
                     logWrite("SPLASH  disabled in config");
                 } else if (hbl && cfg.skip_hbl) {
                     logWrite("SPLASH  skipped (hbmenu title takeover, skip_hbl=1)");
-                } else if (cfg.test_pattern) {
+                } else if (cfg.test_pattern || cfg.test_anim) {
                     started = splashStart(ev.pid, ev.program_id, ev.tick, &cfg, NULL);
                 } else {
                     char path[128];

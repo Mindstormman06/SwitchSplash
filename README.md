@@ -12,13 +12,12 @@ Hardware status (HOS 21.2.0, 2026-11-13):
 - **Milestone 4:** passed (2026-11-13). Jingle plays cleanly during load, the fades work,
   and the game's own audio is unaffected.
 - **Milestone 5:** passed (2026-11-13). Default fade (`fade_mode=auto`) dissolves smoothly
-  into the game. Which method `auto` picked isn't logged here yet. Pixel fallback and
-  `buffers=2` are untested.
-- **Fast start** (built, not yet tested on hardware): the log is written by a background
-  thread and paused during launch, the display connection stays open between splashes, and
-  decoded images are cached in `splash.cache`. Before this, the splash appeared ~175–210 ms
-  after launch detection. Compare `detect->visible` in the log: the first launch of each image
-  decodes the PNG and writes the cache, and the second launch shows the cached speed.
+  into the game, using `ISystemDisplayService#2209 SetLayerAlpha` with `{f32 alpha, u64
+  layer_id}` (confirmed in the log on HOS 21.2.0). Pixel fallback and `buffers=2` are untested.
+- **Fast start:** passed (2026-11-14). Mario Kart 8 Deluxe from cache: visible **67 ms** after
+  launch detection, down from ~175–210 ms. Layer ready in 3 ms, cached frame read in 29–48 ms.
+  hbmenu launches start later (~80 ms detect→begin), probably because hbmenu is loading from SD
+  at the same time.
 
 ## Build
 
@@ -36,6 +35,57 @@ it overwrites your settings.
 
 To read the log, copy it off the SD card directly (card reader or Hekate USB mass storage).
 Network/MTP file access can show stale content.
+
+## Animated GIF splashes
+
+Put `splash.gif` in a folder instead of (or as well as) `splash.png`. If both are there, the
+GIF wins. The jingle, per-game config, HOME cancel and the fade-out work as usual.
+
+- **Resolution:** GIFs are drawn into a **640×360** canvas that the display scales up to full
+  screen (1280×720 double-buffered isn't possible: the system refuses the 4 MiB it needs). A
+  GIF that fits is centred at 1:1; a bigger one is scaled down to fit (nearest neighbour). Make
+  GIFs **640×360** for the best result.
+- **Playback:**
+  - Frame delays come from the GIF. 0–10 ms is treated as 100 ms, as in browsers.
+  - Looping follows the GIF: forever, *n* times, or once (then the last frame holds).
+  - The splash still lasts `duration_ms`. With `duration_ms=0` it lasts as long as the jingle,
+    or one play of the GIF if there's no jingle.
+- **Supported:** GIF87a/89a, local palettes, transparency (shows `background`), all disposal
+  modes, interlacing. Decoded on the fly; no cache.
+- **Logging:** `SPLASH  GIF … first frame presented … detect->visible`, then
+  `GIF played N frames …` with decode times and how many frames were late.
+
+Test file: `samples/splash_test.gif` (640×360, 48 frames, loops).
+
+## Animation test (groundwork for GIF splashes)
+
+**Results (2026-11-14, HOS 21.2.0):**
+- `double` at 640: a locked 60 fps.
+- `double` at 1280: refused, the 4 MiB request fails with `0x10801`.
+- `inplace` at 1280: ~60 fps but visibly tearing.
+
+So GIFs use double-buffered 640×360.
+
+Before writing a GIF player, this checks which way of redrawing the splash works on hardware
+and how fast. With `test_anim=1`, every launch shows an animated pattern instead of the image
+for `duration_ms`:
+- **Scrolling colour bands**, to judge smoothness.
+- **A white bar moving 4 px per frame**, which makes stutter or tearing obvious.
+- **Squares top-left** counting frames in binary. If they flicker or jump, frames are being
+  dropped.
+
+Run these four, one launch each (set the keys in `config.ini` or the game's own config):
+
+| # | `anim_mode` | `anim_width` | Memory | What it tells us |
+|---|---|---|---|---|
+| 1 | `double` | `640` | 2 MiB | The main candidate: does it animate smoothly? |
+| 2 | `inplace` | `640` | 2 MiB | Does the screen pick up changes without re-presenting? |
+| 3 | `double` | `1280` | 4 MiB | Full-res animation: does 4 MiB allocate, and what fps? |
+| 4 | `inplace` | `1280` | 2 MiB | Full-res without the extra memory |
+
+For each, note whether it looked smooth, stuttered, tore (bar broken horizontally), or stayed
+frozen. The log has two `ANIM` lines per run: fps, and per-frame timings (wait for a buffer,
+draw, present). HOME still ends the test at once. Set `test_anim=0` afterwards.
 
 ## Ultrahand overlay
 

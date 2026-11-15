@@ -10,6 +10,8 @@
 #include "dynheap.h"
 #include "fade_pixels.h"
 #include "focus_watch.h"
+#include "gif_canvas.h"
+#include "gif_stream.h"
 #include "image_blit.h"
 #include "log.h"
 #include "png_stream.h"
@@ -17,6 +19,7 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 
 /* Framebuffer resolution. */
@@ -179,6 +182,7 @@ typedef enum {
     Hold_AppExited,
     Hold_HomePressed,
     Hold_PowerPressed,
+    Hold_Error,
 } HoldResult;
 
 /* Waits up to `ms`, waking early on app exit or when the user leaves the game.
@@ -273,6 +277,7 @@ static const char *holdResultName(HoldResult r) {
         case Hold_AppExited:     return "application exited";
         case Hold_HomePressed:   return "HOME pressed";
         case Hold_PowerPressed:  return "power button pressed";
+        case Hold_Error:         return "error";
         default:                 return "done";
     }
 }
@@ -394,6 +399,263 @@ static void cacheWrite(const char *cache_path, const CacheHeader *h, const u16 *
         remove(tmp);
 }
 
+/* ---- Animation test (groundwork for GIF playback, 2026-11-14) ----
+ * test_anim=1 replaces the image with an animated pattern to find out, on hardware, which
+ * redraw method works and how fast:
+ *   anim_mode=double : 2 framebuffers, framebufferBegin/End per frame (standard path)
+ *   anim_mode=inplace: 1 framebuffer, redrawn while presented + cache flush, no re-dequeue
+ * anim_width=640|1280 picks the framebuffer size (16:9); the layer scales it to full screen.
+ * Pattern: scrolling colour bands, a white bar moving 4 px/frame, and a binary frame counter
+ * (top-left squares), so stutter, tearing and dropped frames are visible. */
+typedef struct {
+    u32 w, h, stride, gobs, size;
+} FbGeom;
+
+static FbGeom fbGeom(u32 w, u32 h) {
+    FbGeom g;
+    g.w = w;
+    g.h = h;
+    g.stride = (w * BYTES_PER_PIXEL + 63) & ~63u;
+    g.gobs = g.stride / 64;
+    g.size = g.stride * ((h + 127) & ~127u);
+    return g;
+}
+
+static inline u32 pixelOffsetG(const FbGeom *g, u32 x, u32 y) {
+    const u32 xb = x * BYTES_PER_PIXEL;
+    const u32 off = (y / 128) * (g->gobs * 8192) + (xb / 64) * 8192 + ((y % 128) / 8) * 512 +
+                    ((xb % 64) / 32) * 256 + ((y % 8) / 2) * 64 + ((xb % 32) / 16) * 32 + (y % 2) * 16 + (xb % 16);
+    return off / BYTES_PER_PIXEL;
+}
+
+static void drawAnimFrame(u16 *fb, const FbGeom *g, u32 frame) {
+    const u16 white = rgba4444(0xFF, 0xFF, 0xFF, 0xF);
+    const u32 bar_x = (frame * 4) % g->w;
+    const u32 sq = g->w / 64; /* counter square size */
+    for (u32 y = 0; y < g->h; y++) {
+        const u32 t = (y * 255 / g->h + frame * 3) & 0xFF;
+        const u16 row = rgba4444(t, (t * 2) & 0xFF, 255 - t, 0xF);
+        for (u32 x = 0; x < g->w; x++) {
+            u16 c = row;
+            if (x >= bar_x && x < bar_x + 8)
+                c = white;
+            if (y >= sq && y < 2 * sq && x >= sq && x < sq + 16 * sq * 2) {
+                const u32 bit = (x - sq) / (sq * 2);
+                const bool inside = ((x - sq) % (sq * 2)) < sq;
+                if (inside)
+                    c = (frame >> (15 - bit)) & 1 ? white : rgba4444(0, 0, 0, 0xF);
+            }
+            fb[pixelOffsetG(g, x, y)] = c;
+        }
+    }
+}
+
+typedef struct {
+    u64 sum, max;
+} Stat;
+
+static void statAdd(Stat *s, u64 us) {
+    s->sum += us;
+    if (us > s->max)
+        s->max = us;
+}
+
+static void runAnimTest(Framebuffer *fb, const FbGeom *g, bool inplace, u32 duration_ms, u64 since) {
+    const u64 start = armGetSystemTick();
+    Stat wait = {0}, draw = {0}, present = {0}, frame_t = {0};
+    u32 frames = 0;
+    u16 *px = NULL;
+    u64 last = start;
+
+    while (msSince(start) < duration_ms && !interrupted(since)) {
+        const u64 f0 = armGetSystemTick();
+        if (!inplace || frames == 0) {
+            px = framebufferBegin(fb, NULL);
+        }
+        const u64 f1 = armGetSystemTick();
+        drawAnimFrame(px, g, frames);
+        const u64 f2 = armGetSystemTick();
+        if (!inplace || frames == 0) {
+            framebufferEnd(fb);
+        } else {
+            armDCacheFlush(px, g->size);
+        }
+        const u64 f3 = armGetSystemTick();
+
+        statAdd(&wait, armTicksToNs(f1 - f0) / 1000);
+        statAdd(&draw, armTicksToNs(f2 - f1) / 1000);
+        statAdd(&present, armTicksToNs(f3 - f2) / 1000);
+        if (frames > 0)
+            statAdd(&frame_t, armTicksToNs(f0 - last) / 1000);
+        last = f0;
+        frames++;
+
+        if (inplace) {
+            /* No buffer queue to pace us: aim for ~60 fps. */
+            const u64 spent = armTicksToNs(armGetSystemTick() - f0);
+            if (spent < 16666666ULL)
+                svcSleepThread(16666666ULL - spent);
+        }
+    }
+
+    const u64 total = msSince(start);
+    const u32 n = frames ? frames : 1;
+    logWrite("ANIM    mode=%s %ux%u bufs=%u: %u frames in %lums = %lu.%lu fps", inplace ? "inplace" : "double",
+             g->w, g->h, fb->num_fbs, frames, total, total ? frames * 1000UL / total : 0,
+             total ? (frames * 10000UL / total) % 10 : 0);
+    logWrite("ANIM    avg/max us: wait %lu/%lu  draw %lu/%lu  present %lu/%lu  frame-to-frame %lu/%lu",
+             wait.sum / n, wait.max, draw.sum / n, draw.max, present.sum / n, present.max,
+             frames > 1 ? frame_t.sum / (frames - 1) : 0, frame_t.max);
+}
+
+/* ---- GIF splash (2026-11-14) ----
+ * Hardware test results decided the design: double-buffered 640x360 ran at a locked 60 fps
+ * in the 2 MiB budget; 1280x720 double buffering was refused (0x10801, resource limit);
+ * 1280x720 in place worked but tore. So GIFs render into a 640x360 canvas (centred, or scaled
+ * down if bigger), which is copied into the back buffer for each new frame. Memory, all in
+ * the 2 MiB block: 2 x 480 KiB framebuffers + 450 KiB canvas + 450 KiB disposal backup. */
+#define GIF_W 640
+#define GIF_H 360
+
+static bool hasSuffix(const char *s, const char *suffix) {
+    const size_t a = strlen(s), b = strlen(suffix);
+    return a >= b && strcasecmp(s + a - b, suffix) == 0;
+}
+
+static u16 *presentCanvas(Framebuffer *fb, const FbGeom *g, const u16 *canvas) {
+    u16 *px = framebufferBegin(fb, NULL);
+    for (u32 y = 0; y < g->h; y++) {
+        const u16 *row = &canvas[y * g->w];
+        for (u32 x = 0; x < g->w; x++)
+            px[pixelOffsetG(g, x, y)] = row[x];
+    }
+    framebufferEnd(fb);
+    return px;
+}
+
+/* GIF delay -> ms. Like browsers, 0-1 cs means "as fast as the author forgot to set": 100 ms. */
+static u32 gifDelayMs(u16 cs) {
+    return cs <= 1 ? 100 : (u32)cs * 10;
+}
+
+static HoldResult cancelReason(u64 since) {
+    if (atomic_load(&g_cancel))
+        return Hold_AppExited;
+    if (g_cfg.home_cancel) {
+        if (focusLastHomeTick() > since)
+            return Hold_HomePressed;
+        if (focusLastPowerTick() > since)
+            return Hold_PowerPressed;
+    }
+    return Hold_Done;
+}
+
+/* Plays the GIF for the splash's duration. Returns Hold_Done when the time is up, a cancel
+ * reason, or Hold_Error if nothing could be shown. *last_px is the last presented buffer. */
+static HoldResult playGif(Framebuffer *fb, const FbGeom *g, GifFile *gif, u64 since, bool *audio_on,
+                          u16 **last_px, bool *log_held) {
+    const GifInfo *info = gifGetInfo(gif);
+    const size_t cbytes = (size_t)g->w * g->h * sizeof(u16);
+    u16 *canvas = dynheapAlloc(cbytes);
+    u16 *backup = dynheapAlloc(cbytes); /* may be NULL: "restore previous" then clears instead */
+    if (!canvas) {
+        logWrite("SPLASH  no room for the GIF canvas");
+        return Hold_Error;
+    }
+    GifCanvas gc;
+    gifCanvasInit(&gc, canvas, backup, g->w, g->h, info->width, info->height, g_cfg.background, true);
+
+    /* First frame. */
+    GifFrame fr;
+    u64 td = armGetSystemTick();
+    GifResult r = gifNextFrame(gif, &fr, gifCanvasRow, &gc);
+    if (r != GIF_OK) {
+        logWrite("SPLASH  GIF first frame failed: %s (%d)", gifResultString(r), r);
+        return Hold_Error;
+    }
+    gifCanvasEndFrame(&gc, &fr);
+    const u64 decode_first = msSince(td);
+    *last_px = presentCanvas(fb, g, canvas);
+    logWrite("SPLASH  GIF %ux%u loop=%d: first frame presented (decode %lums), detect->visible=%lums",
+             info->width, info->height, info->loop_count, decode_first, msSince(g_launch_tick));
+    logHold(false);
+    *log_held = false;
+
+    if (g_cfg.audio)
+        *audio_on = audioStart(g_audio_path, (float)g_cfg.volume / 100.0f);
+
+    /* How long to hold: duration_ms, or with duration_ms=0 the jingle's length, or one play
+     * of a finite GIF, or the default for an endless GIF without a jingle. */
+    const bool until_audio_end = g_cfg.duration_ms == 0 && *audio_on;
+    const bool until_anim_end = g_cfg.duration_ms == 0 && !*audio_on && info->loop_count != 0;
+    const u32 hold_ms = g_cfg.duration_ms ? g_cfg.duration_ms
+                       : (until_audio_end || until_anim_end) ? MAX_SPLASH_MS : DEFAULT_SPLASH_MS;
+    const u64 hold_start = armGetSystemTick();
+
+    u64 shown_at = armGetSystemTick();
+    u32 delay = gifDelayMs(fr.delay_cs);
+    u32 plays = 1, frames = 1, late = 0;
+    u64 decode_sum = 0, decode_max = 0;
+    bool animating = true, pending = false;
+
+    for (;;) {
+        const HoldResult c = cancelReason(since);
+        if (c != Hold_Done)
+            return c;
+        if (msSince(hold_start) >= hold_ms || (until_audio_end && !audioIsPlaying()))
+            break;
+        if (until_anim_end && !animating && msSince(shown_at) >= delay)
+            break;
+
+        /* Decode the next frame into the canvas while the current one is on screen. */
+        if (animating && !pending) {
+            td = armGetSystemTick();
+            r = gifNextFrame(gif, &fr, gifCanvasRow, &gc);
+            if (r == GIF_END) {
+                const bool more = info->loop_count == 0 || (info->loop_count > 0 && plays <= (u32)info->loop_count);
+                if (more) {
+                    gifRewind(gif);
+                    gifCanvasReset(&gc);
+                    plays++;
+                    r = gifNextFrame(gif, &fr, gifCanvasRow, &gc);
+                } else {
+                    animating = false; /* play once / loops done: hold the last frame */
+                }
+            }
+            if (animating) {
+                if (r != GIF_OK) {
+                    logWrite("SPLASH  GIF frame %u failed: %s (%d), holding last frame", frames, gifResultString(r), r);
+                    animating = false;
+                } else {
+                    gifCanvasEndFrame(&gc, &fr);
+                    pending = true;
+                    const u64 d = armTicksToNs(armGetSystemTick() - td) / 1000;
+                    decode_sum += d;
+                    if (d > decode_max)
+                        decode_max = d;
+                }
+            }
+        }
+
+        if (pending && msSince(shown_at) >= delay) {
+            if (msSince(shown_at) > delay + 17)
+                late++;
+            *last_px = presentCanvas(fb, g, canvas);
+            shown_at = armGetSystemTick();
+            delay = gifDelayMs(fr.delay_cs);
+            pending = false;
+            frames++;
+        } else {
+            svcSleepThread(2000000ULL);
+        }
+    }
+
+    logWrite("SPLASH  GIF played %u frames (%u play%s), decode avg %luus max %luus, %u late", frames, plays,
+             plays == 1 ? "" : "s", frames > 1 ? (unsigned long)(decode_sum / (frames - 1)) : 0UL,
+             (unsigned long)decode_max, late);
+    return Hold_Done;
+}
+
 static void splashThread(void *arg) {
     Result rc = 0;
     ViLayer layer = {0};
@@ -408,8 +670,16 @@ static void splashThread(void *arg) {
     bool layer_created = false, win_created = false, fb_created = false;
 
     const u64 t0 = armGetSystemTick();
-    const u32 nbuf = g_cfg.buffers;
-    const size_t fb_total = ((size_t)FB_SIZE * nbuf + 0xFFF) & ~0xFFFUL;
+    const bool anim = g_cfg.test_anim;
+    const bool is_gif = !anim && g_has_image && hasSuffix(g_image_path, ".gif");
+    GifFile *gif = NULL;
+    const FbGeom geom = anim     ? fbGeom(g_cfg.anim_width, g_cfg.anim_width * 9 / 16)
+                      : is_gif   ? fbGeom(GIF_W, GIF_H)
+                                 : fbGeom(SCREEN_W, SCREEN_H);
+    const u32 nbuf = anim ? (g_cfg.anim_inplace ? 1 : 2) : is_gif ? 2 : g_cfg.buffers;
+    /* GIFs also need a canvas and a disposal backup in the same block. */
+    const size_t gif_extra = is_gif ? 2 * (((size_t)GIF_W * GIF_H * sizeof(u16) + 0xFFF) & ~0xFFFUL) : 0;
+    const size_t fb_total = (((size_t)geom.size * nbuf + 0xFFF) & ~0xFFFUL) + gif_extra;
 
     logWrite("SPLASH  begin tid=%016lX image=%s detect->begin=%lums",
              g_program_id, g_has_image ? g_image_path : "(test pattern)", msSince(g_launch_tick));
@@ -420,7 +690,13 @@ static void splashThread(void *arg) {
 
     /* 0. Validate the image before touching the display, so a bad file never shows anything.
      *    A matching cache is the fast path; otherwise the PNG is opened and checked. */
-    if (g_has_image) {
+    if (is_gif) {
+        const GifResult gr = gifOpen(&gif, g_image_path);
+        if (gr != GIF_OK) {
+            logWrite("SPLASH  cannot use %s: %s (%d) -> no splash", g_image_path, gifResultString(gr), gr);
+            goto cleanup;
+        }
+    } else if (g_has_image) {
         cachePathFor(g_image_path, cache_path, sizeof(cache_path));
         cache_valid_hdr = cacheHeaderFor(g_image_path, &cache_hdr);
         if (cache_valid_hdr)
@@ -478,18 +754,44 @@ static void splashThread(void *arg) {
     STEP(viSetLayerPosition(&layer, 0.0f, 0.0f));
     STEP(nwindowCreateFromLayer(&win, &layer));
     win_created = true;
-    STEP(framebufferCreate(&fb, &win, SCREEN_W, SCREEN_H, PIXEL_FORMAT_RGBA_4444, nbuf));
+    STEP(framebufferCreate(&fb, &win, geom.w, geom.h, PIXEL_FORMAT_RGBA_4444, nbuf));
     fb_created = true;
 
-    if (fb.fb_size != FB_SIZE) {
-        logWrite("SPLASH  fb_size mismatch (%u != %u), swizzle would be wrong -> aborting", fb.fb_size, (u32)FB_SIZE);
+    if (fb.fb_size != geom.size) {
+        logWrite("SPLASH  fb_size mismatch (%u != %u), swizzle would be wrong -> aborting", fb.fb_size, geom.size);
         goto cleanup;
     }
-    logWrite("SPLASH  layer ready in %lums", msSince(t0));
+    logWrite("SPLASH  layer ready in %lums (%ux%u, %u buffer%s, heap %lu KiB)", msSince(t0), geom.w, geom.h, nbuf,
+             nbuf == 1 ? "" : "s", (unsigned long)(dynheapSize() / 1024));
+
+    if (anim) {
+        logHold(false);
+        log_held = false;
+        runAnimTest(&fb, &geom, g_cfg.anim_inplace, g_cfg.duration_ms ? g_cfg.duration_ms : DEFAULT_SPLASH_MS, t0);
+        goto cleanup;
+    }
 
     /* Find a working layer-alpha command now, at alpha 1.0, so nothing visible changes. */
     if (g_cfg.fade_ms > 0 && g_cfg.fade_mode == FadeMode_Auto)
         alpha_method = probeLayerAlpha(layer.layer_id);
+
+    if (is_gif) {
+        u16 *last_px = NULL;
+        const HoldResult hr = playGif(&fb, &geom, gif, t0, &audio_on, &last_px, &log_held);
+        if (hr == Hold_Error)
+            goto cleanup;
+        if (hr != Hold_Done) {
+            logWrite("SPLASH  cancelled after %lums: %s", msSince(t0), holdResultName(hr));
+            goto cleanup;
+        }
+        if (audio_on && audioIsPlaying()) {
+            audioFadeOut(g_cfg.audio_fade_ms);
+            audio_fade_requested = true;
+        }
+        if (!runFade(&fb, &layer, alpha_method, last_px, t0))
+            logWrite("SPLASH  fade interrupted after %lums", msSince(t0));
+        goto cleanup;
+    }
 
     /* 3. Draw one frame. The buffer is dequeued for the whole decode, so nothing partial
      *    is ever shown; until framebufferEnd the stock boot screen stays visible. */
@@ -585,6 +887,7 @@ cleanup:
         if (audio_on && !audio_fade_requested)
             audioFadeOut(CANCEL_FADE_MS);
         pngClose(img);
+        gifClose(gif);
         if (cache)
             fclose(cache);
         if (fb_created)    framebufferClose(&fb);
@@ -606,23 +909,31 @@ cleanup:
 
 /* ---- public ---- */
 
-SplashImageSource splashFindImage(u64 program_id, bool hbl, char *out, size_t out_size) {
+/* splash.gif wins over splash.png when a folder has both. */
+static bool findInFolder(const char *folder, char *out, size_t out_size) {
     struct stat st;
+    snprintf(out, out_size, "%s/splash.gif", folder);
+    if (stat(out, &st) == 0 && S_ISREG(st.st_mode))
+        return true;
+    snprintf(out, out_size, "%s/splash.png", folder);
+    return stat(out, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+SplashImageSource splashFindImage(u64 program_id, bool hbl, char *out, size_t out_size) {
+    char folder[64];
 
     if (hbl) {
-        snprintf(out, out_size, SPLASH_ROOT "/hbl/splash.png");
-        if (stat(out, &st) == 0 && S_ISREG(st.st_mode))
+        if (findInFolder(SPLASH_ROOT "/hbl", out, out_size))
             return SplashImage_Hbl;
         out[0] = '\0';
         return SplashImage_None;
     }
 
-    snprintf(out, out_size, SPLASH_ROOT "/%016lX/splash.png", program_id);
-    if (stat(out, &st) == 0 && S_ISREG(st.st_mode))
+    snprintf(folder, sizeof(folder), SPLASH_ROOT "/%016lX", program_id);
+    if (findInFolder(folder, out, out_size))
         return SplashImage_Title;
 
-    snprintf(out, out_size, SPLASH_ROOT "/default/splash.png");
-    if (stat(out, &st) == 0 && S_ISREG(st.st_mode))
+    if (findInFolder(SPLASH_ROOT "/default", out, out_size))
         return SplashImage_Default;
 
     out[0] = '\0';

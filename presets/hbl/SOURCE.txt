@@ -7,3 +7,9 @@ assets by fail0verflow / Team Twiizers:
 
 Generated with tools/hbc_banner_to_splash.py: one still frame of the animated banner, and the
 banner jingle (intro + one pass of the loop) resampled from 32 kHz to 48 kHz.
+
+splash.gif is the banner's real animation (water rising in, the bubble burst, the white flash
+and the title), replayed from the keyframes in channel/banner/banner/mkbanner.py by
+tools/hbc_banner_to_gif.py: 640x360, 30 fps, 12.6 s (the length of splash.wav, in sync with
+it), plays once. It wins over splash.png when both are present. config.ini makes hbmenu
+launches show it for 6 s.

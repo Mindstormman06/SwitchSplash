@@ -27,6 +27,11 @@ static bool isFile(const std::string &p) {
     return stat(p.c_str(), &st) == 0 && S_ISREG(st.st_mode);
 }
 
+/* A folder's splash image: splash.gif or splash.png (the sysmodule prefers the GIF). */
+static bool hasImage(const std::string &folder) {
+    return isFile(folder + "/splash.gif") || isFile(folder + "/splash.png");
+}
+
 static void mkdirs(const std::string &path) {
     /* sdmc:/a/b/c -> create each level */
     for (size_t i = std::strlen("sdmc:/"); i <= path.size(); i++) {
@@ -253,8 +258,8 @@ Resolved resolve(const Scope &scope, const Setting &s, bool includeOwn) {
     }
 
     if (scope.kind == ScopeKind::Title) {
-        const bool own = isFile(scope.folder() + "/splash.png");
-        const bool def = isFile(std::string(ROOT) + "/default/splash.png");
+        const bool own = hasImage(scope.folder());
+        const bool def = hasImage(std::string(ROOT) + "/default");
         if (!own && def)
             apply(Scope{ScopeKind::Default}.configPath());
     }
@@ -285,7 +290,7 @@ bool writeSetting(const Scope &scope, const Setting &s, const std::optional<std:
 
 FolderInfo folderInfo(const Scope &scope) {
     const std::string d = scope.folder();
-    return {isFile(d + "/splash.png"), isFile(d + "/splash.wav"), isFile(d + "/config.ini"),
+    return {hasImage(d), isFile(d + "/splash.wav"), isFile(d + "/config.ini"),
             isFile(d + "/splash.cache")};
 }
 

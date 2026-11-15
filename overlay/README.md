@@ -17,6 +17,9 @@ Installed as `sdmc:/switch/.overlays/switchsplash.ovl` (in `dist/` after `.\buil
 - **Sysmodule:** start or stop it now, toggle *Start at boot* (`boot2.flag`), and clear every
   `splash.cache`.
 
+A folder's "image" can be `splash.png` or `splash.gif`; the overlay treats either the same way
+when it works out which config files apply.
+
 On a game, default or hbmenu page, each setting shows the value a launch would use. Values
 shown **faint** are inherited. Pick **Inherit** to remove the folder's own value. **Reset to
 inherited** deletes the folder's `config.ini`, and **Clear image cache** deletes its

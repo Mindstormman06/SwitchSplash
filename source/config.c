@@ -21,6 +21,9 @@ static void setDefaults(Config *c) {
     c->buffers          = 1;
     c->test_pattern     = false;
     c->test_redraw      = false;
+    c->test_anim        = false;
+    c->anim_inplace     = false;
+    c->anim_width       = 640;
 }
 
 static char *trim(char *s) {
@@ -90,6 +93,9 @@ bool configApply(Config *c, const char *path) {
         else if (!strcmp(key, "buffers"))          c->buffers          = strtoul(val, NULL, 10);
         else if (!strcmp(key, "test_pattern"))     c->test_pattern     = parseBool(val);
         else if (!strcmp(key, "test_redraw"))      c->test_redraw      = parseBool(val);
+        else if (!strcmp(key, "test_anim"))        c->test_anim        = parseBool(val);
+        else if (!strcmp(key, "anim_mode"))        c->anim_inplace     = !strcmp(val, "inplace");
+        else if (!strcmp(key, "anim_width"))       c->anim_width       = strtoul(val, NULL, 10);
     }
     fclose(f);
 
@@ -100,5 +106,6 @@ bool configApply(Config *c, const char *path) {
     if (c->volume > 100) c->volume = 100;
     if (c->audio_fade_ms > 5000) c->audio_fade_ms = 5000;
     if (c->fade_ms > 5000) c->fade_ms = 5000;
+    if (c->anim_width != 1280) c->anim_width = 640;
     return true;
 }

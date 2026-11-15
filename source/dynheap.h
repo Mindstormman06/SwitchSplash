@@ -19,3 +19,7 @@ Result dynheapAcquire(size_t size);
 void dynheapRelease(void);
 
 size_t dynheapSize(void);
+
+/* Carves `size` bytes (page aligned) out of the acquired block, after anything already
+ * handed out. NULL if it doesn't fit. Freed only by dynheapRelease. */
+void *dynheapAlloc(size_t size);

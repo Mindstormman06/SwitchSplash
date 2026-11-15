@@ -27,6 +27,9 @@ typedef struct {
     u32  buffers;          /* buffers=1 (1 or 2) */
     bool test_pattern;     /* test_pattern=0: draw the M2 alpha test screen for every title */
     bool test_redraw;      /* test_redraw=0: re-present one frame after the hold (may block with 1 buffer!) */
+    bool test_anim;        /* test_anim=0: animated test pattern instead of the image (GIF groundwork) */
+    bool anim_inplace;     /* anim_mode=double|inplace */
+    u32  anim_width;       /* anim_width=640|1280 (16:9) */
 } Config;
 
 /* Reads config.ini. Missing file/keys -> defaults. Called on every launch so edits
